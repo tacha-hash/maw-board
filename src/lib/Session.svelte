@@ -723,8 +723,8 @@
     if (n === 0) return;
     const nCols = n <= 4 ? 2 : 3;
     const nRows = Math.ceil(n / nCols);
-    const COLS = 80;
-    const ROWS = 24;
+    const COLS = 90;
+    const ROWS = 40;
     // Approximate rendered window footprint in world px (incl. header + gaps).
     const TERM_W = COLS * 9 + 40;
     const TERM_H = ROWS * 17 + 80;

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
+  import StatusBar from "./StatusBar.svelte";
   import {
     GridIcon,
     ImageIcon,
@@ -38,6 +39,10 @@
       <TerminalIcon size="18" strokeWidth={2} />
       <span>Oracle Board</span>
     </div>
+
+    <div class="v-divider" />
+
+    <StatusBar />
 
     <div class="v-divider" />
 
