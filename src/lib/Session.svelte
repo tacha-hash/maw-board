@@ -140,6 +140,7 @@
 
   let chatMessages: ChatMessage[] = [];
   let newMessages = false;
+  let initialShellsReceived = false;
 
   // ── maw share workboard extensions ──
   let boardItems: BoardItem[] = [];
@@ -242,6 +243,11 @@
           if (movingIsDone) {
             moving = -1;
           }
+          // Auto-create one terminal when joining a fresh empty session.
+          if (!initialShellsReceived && message.shells.length === 0 && hasWriteAccess !== false) {
+            handleCreate();
+          }
+          initialShellsReceived = true;
           for (const [id] of message.shells) {
             if (!subscriptions.has(id)) {
               chunknums[id] ??= 0;
