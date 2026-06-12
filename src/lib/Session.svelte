@@ -819,21 +819,51 @@
     }
   }
 
-  // Tile all open terminals into a uniform grid and recenter the view on it.
-  // Columns auto-scale: ≤2 → 2 cols (1 row), ≤4 → 2 cols (2×2), else 3 cols.
-  function tileWindows() {
+  // Tile all open terminals into a uniform layout and recenter on it.
+  // mode: "grid" (auto), "2col", "3col", "rows" (stacked), "cols" (side-by-side),
+  // or a number = explicit column count.
+  function tileWindows(mode: string | number = "grid") {
     if (!hasWriteAccess) return;
     const n = shells.length;
     if (n === 0) return;
-    const nCols = n <= 4 ? 2 : 3;
-    const nRows = Math.ceil(n / nCols);
+
     const COLS = 90;
     const ROWS = 40;
-    // Approximate rendered window footprint in world px (incl. header + gaps).
-    const TERM_W = COLS * 9 + 40;
-    const TERM_H = ROWS * 17 + 80;
+
+    let nCols: number;
+    if (typeof mode === "number") nCols = Math.max(1, Math.min(mode, n));
+    else if (mode === "rows") nCols = 1;
+    else if (mode === "cols") nCols = n;
+    else if (mode === "2col") nCols = 2;
+    else if (mode === "3col") nCols = 3;
+    else nCols = n <= 4 ? 2 : 3; // grid (auto)
+    const nRows = Math.ceil(n / nCols);
+
+    // Measure the ACTUAL rendered cell size from a live terminal so windows
+    // never overlap (the previous fixed estimate was too small for tall ones).
+    // getBoundingClientRect is post-zoom screen px → divide by zoom for world px.
+    let cellW = 9.6;
+    let cellH = 19;
+    const firstId = shells[0][0];
+    const screenEl = termElements[firstId]?.querySelector(
+      ".xterm-screen",
+    ) as HTMLElement | null;
+    if (screenEl && zoom) {
+      const ws0 = shells[0][1];
+      const r = screenEl.getBoundingClientRect();
+      if (r.width && r.height && ws0.cols && ws0.rows) {
+        cellW = r.width / ws0.cols / zoom;
+        cellH = r.height / ws0.rows / zoom;
+      }
+    }
+    const CHROME_W = 36; // borders + horizontal padding (world px)
+    const CHROME_H = 60; // title bar + vertical padding (world px)
+    const GAP = 48;
+    const TERM_W = COLS * cellW + CHROME_W + GAP;
+    const TERM_H = ROWS * cellH + CHROME_H + GAP;
     const gridW = nCols * TERM_W;
     const gridH = nRows * TERM_H;
+
     shells.forEach(([id, ws], i) => {
       const col = i % nCols;
       const row = Math.floor(i / nCols);
@@ -841,14 +871,13 @@
       const y = Math.round(-gridH / 2 + row * TERM_H);
       srocket?.send({ move: [id, { ...ws, x, y, rows: ROWS, cols: COLS }] });
     });
-    // Recenter + zoom so the whole grid (centered on world origin) fits in view.
-    // Go through touchZoom — it owns center/zoom, so assigning them directly
-    // would get overwritten on its next frame.
+    // Recenter + zoom so the whole grid (centered on origin) fits. touchZoom
+    // owns center/zoom, so assigning them directly would get overwritten.
     const fit = Math.min(
       window.innerWidth / (gridW + 160),
       window.innerHeight / (gridH + 160),
     );
-    touchZoom.moveTo([0, 0], Math.max(0.3, Math.min(1, fit)));
+    touchZoom.moveTo([0, 0], Math.max(0.25, Math.min(1, fit)));
   }
 
   // Reset the view back to the origin.
