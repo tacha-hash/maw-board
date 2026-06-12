@@ -28,6 +28,7 @@
     type StreamController,
     type VoiceController,
   } from "./board";
+  import { RtcMesh } from "./rtc";
   import { makeToast } from "./toast";
   import Board from "./ui/Board.svelte";
   import Chat, { type ChatMessage } from "./ui/Chat.svelte";
@@ -148,6 +149,11 @@
   let streamSrcs: Record<string, string> = {};
   let voice: VoiceController | null = null;
   let micRecording = false;
+  // WebRTC P2P mesh for voice/video (replaces WS voice relay for low latency).
+  let rtcMesh: RtcMesh | null = null;
+  let micStream: MediaStream | null = null;
+  // Remote audio elements keyed by peer UID.
+  let remoteAudios: Record<number, HTMLAudioElement> = {};
   let stream: StreamController | null = null;
   let streamActive = false;
   let myStreamId: string | null = null;
@@ -211,6 +217,20 @@
             message: `Connected to the server.`,
           });
           exitReason = null;
+          // Initialize WebRTC mesh now that we know our UID.
+          rtcMesh?.dispose();
+          rtcMesh = new RtcMesh(
+            userId,
+            (target, payload) => srocket?.send({ signal: [target, payload] }),
+            (uid, track) => {
+              if (track.kind === "audio") {
+                const audio = new Audio();
+                audio.srcObject = new MediaStream([track]);
+                audio.play().catch(() => {});
+                remoteAudios[uid] = audio;
+              }
+            },
+          );
         } else if (message.invalidAuth) {
           exitReason =
             "The URL is not correct, invalid end-to-end encryption key.";
@@ -232,11 +252,17 @@
           });
         } else if (message.users) {
           users = message.users;
+          for (const [uid] of users) rtcMesh?.addPeer(uid);
         } else if (message.userDiff) {
           const [id, update] = message.userDiff;
           users = users.filter(([uid]) => uid !== id);
           if (update !== null) {
             users = [...users, [id, update]];
+            rtcMesh?.addPeer(id);
+          } else {
+            rtcMesh?.removePeer(id);
+            remoteAudios[id]?.pause();
+            delete remoteAudios[id];
           }
         } else if (message.shells) {
           shells = message.shells;
@@ -276,6 +302,17 @@
           if (item) upsertBoardItem({ ...item, x, y });
         } else if (message.boardDelete) {
           removeBoardItem(message.boardDelete);
+        } else if (message.signal) {
+          // Signal format: [from_uid, payload] (targeted) or
+          // [from_uid, to_uid, payload] (broadcast — client filters).
+          const sig = message.signal as number[] & string[];
+          if (sig.length === 3) {
+            const [from, to, payload] = sig as unknown as [number, number, string];
+            if (to === userId) rtcMesh?.handleSignal(from, payload);
+          } else {
+            const [from, payload] = sig as unknown as [number, string];
+            rtcMesh?.handleSignal(from, payload);
+          }
         } else if (message.shellLatency !== undefined) {
           const shellLatency = Number(message.shellLatency);
           shellLatencies = [...shellLatencies, shellLatency].slice(-10);
@@ -301,6 +338,10 @@
         users = [];
         serverLatencies = [];
         shellLatencies = [];
+        rtcMesh?.dispose();
+        rtcMesh = null;
+        for (const audio of Object.values(remoteAudios)) audio.pause();
+        remoteAudios = {};
       },
 
       onClose(event) {
@@ -471,25 +512,29 @@
 
   // ── maw share workboard handlers ──
 
-  // Push-to-talk: press starts a clip, release (anywhere) ends and sends it.
-  function handleMicDown() {
-    if (!voice) voice = createVoiceCapture((bytes) => srocket?.send({ voice: bytes }));
-    voice
-      .start()
-      .then(() => (micRecording = true))
-      .catch(() => makeToast({ kind: "error", message: "Microphone blocked." }));
-  }
-
-  onMount(() => {
-    const stopTalk = () => {
-      if (voice?.recording) {
-        voice.stop();
-        micRecording = false;
+  // Mic toggle: add/remove audio track from WebRTC mesh (P2P, low latency).
+  // Falls back to WS Voice relay if no peers connected yet.
+  async function handleMicDown() {
+    if (micRecording && micStream) {
+      // Stop mic — remove track from mesh, stop stream.
+      for (const track of micStream.getAudioTracks()) {
+        rtcMesh?.removeTrack(track);
+        track.stop();
       }
-    };
-    window.addEventListener("pointerup", stopTalk);
-    return () => window.removeEventListener("pointerup", stopTalk);
-  });
+      micStream = null;
+      micRecording = false;
+      return;
+    }
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      for (const track of micStream.getAudioTracks()) {
+        rtcMesh?.addTrack(track);
+      }
+      micRecording = true;
+    } catch {
+      makeToast({ kind: "error", message: "Microphone blocked." });
+    }
+  }
 
   // Add an image to the board (file picker, paste, or drag-and-drop).
   function addImage(file: File) {
@@ -602,6 +647,9 @@
 
   onDestroy(() => {
     stream?.stop();
+    rtcMesh?.dispose();
+    micStream?.getTracks().forEach((t) => t.stop());
+    for (const audio of Object.values(remoteAudios)) audio.pause();
     for (const url of Object.values(streamSrcs)) URL.revokeObjectURL(url);
   });
 </script>

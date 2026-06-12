@@ -69,9 +69,9 @@
       <button
         class="icon-button"
         class:recording={micRecording}
-        on:pointerdown={() => dispatch("micDown")}
+        on:click={() => dispatch("micDown")}
         disabled={!connected}
-        title="Hold to talk"
+        title={micRecording ? "Mute mic" : "Unmute mic"}
       >
         <MicIcon strokeWidth={1.5} class="p-0.5" />
       </button>

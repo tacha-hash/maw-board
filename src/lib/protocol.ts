@@ -47,6 +47,8 @@ export type WsServer = {
   boardPut?: BoardItem;
   boardMove?: [string, number, number];
   boardDelete?: string;
+  // ── WebRTC signaling relay ──
+  signal?: [Uid, string]; // [from_uid, payload_json]
   error?: string;
 };
 
@@ -69,4 +71,6 @@ export type WsClient = {
   boardPut?: BoardItem;
   boardMove?: [string, number, number];
   boardDelete?: string;
+  // ── WebRTC signaling relay ──
+  signal?: [number, string]; // [target_uid, payload_json]
 };
