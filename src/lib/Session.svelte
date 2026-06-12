@@ -851,6 +851,22 @@
     touchZoom.moveTo([0, 0], Math.max(0.3, Math.min(1, fit)));
   }
 
+  // Reset the view back to the origin.
+  function handleCenter() {
+    touchZoom.moveTo([0, 0], INITIAL_ZOOM);
+  }
+
+  // Clear the board — remove notes/images/videos/streams (keeps terminals and
+  // the shared document).
+  function handleClear() {
+    if (hasWriteAccess === false) return;
+    for (const item of boardItems) {
+      if (item.kind === "doc") continue;
+      srocket?.send({ boardDelete: item.id });
+      removeBoardItem(item.id);
+    }
+  }
+
   function handleBoardMove(id: string, x: number, y: number) {
     const item = boardItems.find((it) => it.id === id);
     if (item) upsertBoardItem({ ...item, x, y });
@@ -890,6 +906,8 @@
       {cameraActive}
       on:create={handleCreate}
       on:tile={tileWindows}
+      on:center={handleCenter}
+      on:clear={handleClear}
       on:note={addNote}
       on:video={handleVideoPick}
       on:files={() => (showExplorer = !showExplorer)}
@@ -1009,9 +1027,14 @@
         Connecting…
       </div>
     {/if}
-
-    <NameList {users} />
   </div>
+
+  <!-- Online users — vertical column down the left edge. -->
+  {#if users.length > 0}
+    <div class="fixed left-3 top-24 z-30 max-h-[70vh] overflow-y-auto pointer-events-auto">
+      <NameList {users} vertical />
+    </div>
+  {/if}
 
   <div class="absolute inset-0 overflow-hidden touch-none" bind:this={fabricEl}>
     <Board

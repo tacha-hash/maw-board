@@ -5,12 +5,13 @@
   import { nameToHue } from "./LiveCursor.svelte";
 
   export let users: [number, WsUser][];
+  export let vertical: boolean = false;
   $: sortedUsers = [...users].sort(
     (a, b) => Number(b[1].canWrite) - Number(a[1].canWrite),
   );
 </script>
 
-<ul class="flex flex-wrap gap-1">
+<ul class="flex gap-1" class:flex-col={vertical} class:flex-wrap={!vertical}>
   {#each sortedUsers as [id, user] (id)}
     <li
       class="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-zinc-800/80 border border-zinc-700/50"

@@ -2,11 +2,15 @@
   import { createEventDispatcher } from "svelte";
   import StatusBar from "./StatusBar.svelte";
   import {
+    ChevronLeftIcon,
+    ChevronRightIcon,
+    CrosshairIcon,
     Edit2Icon,
     FileTextIcon,
     FilmIcon,
     FolderIcon,
     GridIcon,
+    Trash2Icon,
     ImageIcon,
     MessageSquareIcon,
     MicIcon,
@@ -27,6 +31,8 @@
   const dispatch = createEventDispatcher<{
     create: void;
     tile: void;
+    center: void;
+    clear: void;
     note: void;
     video: void;
     files: void;
@@ -39,6 +45,8 @@
     stream: void;
     camera: void;
   }>();
+
+  let collapsed = false;
 </script>
 
 <div class="panel inline-block px-3 py-2">
@@ -54,7 +62,22 @@
 
     <div class="v-divider" />
 
-    <div class="flex space-x-1">
+    <button
+      class="icon-button"
+      on:click={() => (collapsed = !collapsed)}
+      title={collapsed ? "Expand toolbar" : "Collapse toolbar"}
+    >
+      {#if collapsed}
+        <ChevronRightIcon strokeWidth={1.5} class="p-0.5" />
+      {:else}
+        <ChevronLeftIcon strokeWidth={1.5} class="p-0.5" />
+      {/if}
+    </button>
+
+    {#if !collapsed}
+      <div class="v-divider" />
+
+      <div class="flex space-x-1">
       <button
         class="icon-button"
         on:click={() => dispatch("create")}
@@ -74,6 +97,21 @@
         title="Tile terminals into a grid"
       >
         <GridIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+      <button
+        class="icon-button"
+        on:click={() => dispatch("center")}
+        title="Center / reset view"
+      >
+        <CrosshairIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+      <button
+        class="icon-button"
+        on:click={() => dispatch("clear")}
+        disabled={!connected || hasWriteAccess === false}
+        title="Clear the board (notes/images/videos)"
+      >
+        <Trash2Icon strokeWidth={1.5} class="p-0.5" />
       </button>
       <button
         class="icon-button"
@@ -155,6 +193,7 @@
         <WifiIcon strokeWidth={1.5} class="p-0.5" />
       </button>
     </div>
+    {/if}
   </div>
 </div>
 
