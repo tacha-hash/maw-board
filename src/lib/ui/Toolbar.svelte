@@ -11,6 +11,8 @@
     FilmIcon,
     FolderIcon,
     GridIcon,
+    LockIcon,
+    UnlockIcon,
     Trash2Icon,
     ImageIcon,
     MessageSquareIcon,
@@ -28,9 +30,12 @@
   // ── maw share workboard extensions ──
   export let micRecording = false;
   export let cameraActive = false;
+  export let boardLocked = false;
+  export let lockedForMe = false;
 
   const dispatch = createEventDispatcher<{
     create: void;
+    lock: void;
     tile: string | number;
     center: void;
     clear: void;
@@ -123,6 +128,23 @@
         title="Clear the board (notes/images/videos)"
       >
         <Trash2Icon strokeWidth={1.5} class="p-0.5" />
+      </button>
+      <button
+        class="icon-button"
+        class:lock-on={boardLocked}
+        on:click={() => dispatch("lock")}
+        disabled={!connected || hasWriteAccess === false || lockedForMe}
+        title={boardLocked
+          ? lockedForMe
+            ? "Board is locked by someone else"
+            : "Board locked — click to unlock"
+          : "Lock the board (others become read-only)"}
+      >
+        {#if boardLocked}
+          <LockIcon strokeWidth={1.5} class="p-0.5" />
+        {:else}
+          <UnlockIcon strokeWidth={1.5} class="p-0.5" />
+        {/if}
       </button>
       <button
         class="icon-button"
@@ -229,6 +251,10 @@
 
   .icon-button.active {
     @apply bg-indigo-600 text-white hover:bg-indigo-500;
+  }
+
+  .icon-button.lock-on {
+    @apply bg-amber-500 text-zinc-900 hover:bg-amber-400;
   }
 
   .activity {

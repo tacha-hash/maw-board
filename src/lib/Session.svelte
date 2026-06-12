@@ -426,10 +426,12 @@
   let counter = 0n;
 
   async function handleCreate() {
-    if (hasWriteAccess === false) {
+    if (!canEdit) {
       makeToast({
         kind: "info",
-        message: "You are in read-only mode and cannot create new terminals.",
+        message: lockedForMe
+          ? `Board is locked by ${boardLock?.ownerName ?? "someone"} — read-only.`
+          : "You are in read-only mode and cannot create new terminals.",
       });
       return;
     }
@@ -452,6 +454,7 @@
   }
 
   async function handleInput(id: number, data: Uint8Array) {
+    if (lockedForMe) return; // soft lock: swallow keystrokes for locked-out users
     if (counter === 0n) {
       // On the first call, initialize the counter to a random 64-bit integer.
       const array = new Uint8Array(8);
@@ -582,7 +585,7 @@
 
   // Add an image to the board (file picker, paste, or drag-and-drop).
   function addImage(file: File) {
-    if (hasWriteAccess === false) return;
+    if (!canEdit) return;
     readImageFile(file, (dataUrl, w, h) => {
       const [x, y] = nextBoardPos();
       const item: BoardItem = {
@@ -601,7 +604,7 @@
 
   // Add an editable sticky note to the board.
   function addNote() {
-    if (hasWriteAccess === false) return;
+    if (!canEdit) return;
     const [x, y] = nextBoardPos();
     const item: BoardItem = {
       id: crypto.randomUUID(),
@@ -622,7 +625,7 @@
   $: docText = boardItems.find((it) => it.id === DOC_ID)?.dataUrl ?? "";
 
   function handleDocEdit(text: string) {
-    if (hasWriteAccess === false) return;
+    if (!canEdit) return;
     const item: BoardItem = {
       id: DOC_ID,
       kind: "doc",
@@ -634,6 +637,67 @@
     };
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
+  }
+
+  // ── Soft board lock (Bo 2026-06-13) ───────────────────────────────────────
+  // A singleton board item (rides the existing board sync — no server change)
+  // that flips everyone except the locker into read-only. "Soft": it gates the
+  // client UI to stop accidental edits, not a cryptographic write-lock.
+  const LOCK_ID = "__board_lock__";
+  $: lockItem = boardItems.find((it) => it.id === LOCK_ID);
+  $: boardLock = (() => {
+    try {
+      return lockItem?.dataUrl ? JSON.parse(lockItem.dataUrl) : null;
+    } catch {
+      return null;
+    }
+  })();
+  $: boardLocked = !!boardLock?.locked;
+  $: lockedForMe = boardLocked && boardLock.ownerId !== userId;
+  // Combined edit permission: have server write access AND not locked out.
+  $: canEdit = hasWriteAccess !== false && !lockedForMe;
+
+  function toggleLock() {
+    if (hasWriteAccess === false) {
+      makeToast({
+        kind: "info",
+        message: "Read-only viewers can't lock the board.",
+      });
+      return;
+    }
+    if (boardLocked && lockedForMe) {
+      makeToast({
+        kind: "info",
+        message: `Board is locked by ${boardLock.ownerName ?? "someone"}.`,
+      });
+      return;
+    }
+    const nowLocked = !boardLocked;
+    const item: BoardItem = {
+      id: LOCK_ID,
+      kind: "lock",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: JSON.stringify(
+        nowLocked
+          ? {
+              locked: true,
+              ownerId: userId,
+              ownerName: $settings.name || "someone",
+            }
+          : { locked: false },
+      ),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+    makeToast({
+      kind: "success",
+      message: nowLocked
+        ? "🔒 Board locked — everyone else is read-only"
+        : "🔓 Board unlocked",
+    });
   }
 
   // Persist a note's edited text to peers.
@@ -942,21 +1006,23 @@
   // Clear the board — remove notes/images/videos/streams (keeps terminals and
   // the shared document).
   function handleClear() {
-    if (hasWriteAccess === false) return;
+    if (!canEdit) return;
     for (const item of boardItems) {
-      if (item.kind === "doc") continue;
+      if (item.kind === "doc" || item.kind === "lock") continue;
       srocket?.send({ boardDelete: item.id });
       removeBoardItem(item.id);
     }
   }
 
   function handleBoardMove(id: string, x: number, y: number) {
+    if (lockedForMe) return;
     const item = boardItems.find((it) => it.id === id);
     if (item) upsertBoardItem({ ...item, x, y });
     srocket?.send({ boardMove: [id, x, y] });
   }
 
   function handleBoardDelete(id: string) {
+    if (lockedForMe) return;
     removeBoardItem(id);
     srocket?.send({ boardDelete: id });
   }
@@ -990,7 +1056,10 @@
       {hasWriteAccess}
       {micRecording}
       {cameraActive}
+      {boardLocked}
+      {lockedForMe}
       on:create={handleCreate}
+      on:lock={toggleLock}
       on:tile={({ detail }) => tileWindows(detail)}
       on:center={handleCenter}
       on:clear={handleClear}
@@ -1030,22 +1099,34 @@
   </div>
 
   <!--
-    Faint peek-handle: when the auto-hiding toolbar is tucked away, a soft pill
-    stays pinned to the very top edge so you always know where it lives — tap or
+    Peek-handle: when the auto-hiding toolbar is tucked away, a clearly-visible
+    pill stays pinned to the top edge so you always know where it lives — tap or
     hover it to bring the toolbar back. Fades out while the toolbar is showing.
+    (Bo 2026-06-13: made bold + a chevron — the old faint 25% line was invisible.)
   -->
   <button
-    class="absolute top-0 left-1/2 -translate-x-1/2 z-20 w-20 h-6 flex items-center justify-center cursor-pointer group transition-opacity duration-300 ease-out"
+    class="absolute top-1.5 left-1/2 -translate-x-1/2 z-20 px-3 py-1 flex items-center gap-1.5 rounded-full bg-zinc-900/80 ring-1 ring-white/25 shadow-lg backdrop-blur-sm cursor-pointer group transition-all duration-300 ease-out hover:bg-zinc-800/90 hover:ring-white/50"
     class:opacity-0={toolbarVisible}
     class:pointer-events-none={toolbarVisible}
     on:pointerenter={showToolbar}
     on:click={showToolbar}
     aria-label="Show toolbar"
+    title="Show toolbar"
   >
     <span
-      class="w-9 h-1 rounded-full bg-white/25 group-hover:w-12 group-hover:bg-white/60 transition-all duration-200"
+      class="w-7 h-1 rounded-full bg-white/80 group-hover:w-9 group-hover:bg-white transition-all duration-200"
     />
+    <span class="text-white/80 text-[11px] leading-none group-hover:text-white">⌄</span>
   </button>
+
+  <!-- Lock banner: tells locked-out viewers why the board is read-only. -->
+  {#if lockedForMe}
+    <div
+      class="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/95 text-zinc-900 text-sm font-semibold shadow-lg pointer-events-none"
+    >
+      🔒 Board locked by {boardLock?.ownerName ?? "someone"} — view only
+    </div>
+  {/if}
 
   {#if showChat}
     <div

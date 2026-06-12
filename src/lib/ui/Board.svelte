@@ -130,7 +130,7 @@
   }
 </script>
 
-{#each items.filter((it) => it.kind !== "doc") as item (item.id)}
+{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock") as item (item.id)}
   {@const x = item.id === dragId ? dragPos[0] : item.x}
   {@const y = item.id === dragId ? dragPos[1] : item.y}
   <div
