@@ -16,7 +16,6 @@
   export let newMessages: boolean;
   // ── maw share workboard extensions ──
   export let micRecording = false;
-  export let streamActive = false;
   export let cameraActive = false;
 
   const dispatch = createEventDispatcher<{

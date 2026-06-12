@@ -8,12 +8,18 @@
   import { XIcon, VideoIcon } from "svelte-feather-icons";
 
   export let stream: MediaStream;
+  export let label: string = "Camera";
+  export let mirror: boolean = true; // mirror local self-view, not remote peers
+  export let closable: boolean = true;
+  export let index: number = 0; // stagger multiple windows so they don't overlap
 
   const dispatch = createEventDispatcher<{ close: void }>();
 
-  // Window geometry (px). Default: top-right corner.
-  let x = typeof window !== "undefined" ? window.innerWidth - 320 : 40;
-  let y = 84;
+  // Window geometry (px). Default: stack down the top-right corner.
+  let x =
+    (typeof window !== "undefined" ? window.innerWidth - 320 : 40) -
+    index * 24;
+  let y = 84 + index * 232;
   let w = 288;
   let h = 216;
 
@@ -81,16 +87,19 @@
   <div class="cam-header" on:pointerdown={startDrag}>
     <div class="flex items-center gap-1.5 text-xs text-zinc-300 font-medium">
       <VideoIcon size="14" />
-      <span>Camera</span>
+      <span>{label}</span>
     </div>
-    <button class="cam-close" title="Turn camera off" on:click={() => dispatch("close")}>
-      <XIcon size="14" />
-    </button>
+    {#if closable}
+      <button class="cam-close" title="Turn camera off" on:click={() => dispatch("close")}>
+        <XIcon size="14" />
+      </button>
+    {/if}
   </div>
 
   <!-- svelte-ignore a11y-media-has-caption -->
   <video
     class="cam-video"
+    class:mirror
     autoplay
     playsinline
     muted
@@ -118,7 +127,10 @@
 
   .cam-video {
     @apply flex-1 w-full h-full object-cover bg-black;
-    transform: scaleX(-1); /* mirror local preview like a selfie */
+  }
+
+  .cam-video.mirror {
+    transform: scaleX(-1); /* mirror local self-view like a selfie */
   }
 
   .cam-resize {

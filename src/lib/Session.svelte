@@ -157,6 +157,7 @@
   let cameraActive = false;
   // Remote audio elements keyed by peer UID.
   let remoteAudios: Record<number, HTMLAudioElement> = {};
+  let remoteVideos: Record<number, MediaStream> = {}; // live remote camera streams
   let stream: StreamController | null = null;
   let streamActive = false;
   let myStreamId: string | null = null;
@@ -232,34 +233,13 @@
                 audio.play().catch(() => {});
                 remoteAudios[uid] = audio;
               } else if (track.kind === "video") {
-                // Remote screen-share or camera — render into a <video> and
-                // capture frames into the stream tile's objectURL.
-                const video = document.createElement("video");
-                video.srcObject = streams[0] ?? new MediaStream([track]);
-                video.muted = true;
-                video.play().catch(() => {});
-                const canvas = document.createElement("canvas");
-                const ctx = canvas.getContext("2d");
-                const interval = window.setInterval(() => {
-                  if (video.videoWidth && ctx) {
-                    const s = Math.min(1, 640 / video.videoWidth);
-                    canvas.width = Math.round(video.videoWidth * s);
-                    canvas.height = Math.round(video.videoHeight * s);
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    canvas.toBlob((blob) => {
-                      if (blob) {
-                        const key = `rtc-video-${uid}`;
-                        setStreamFrame(key, new Uint8Array(0));
-                        const url = URL.createObjectURL(blob);
-                        if (streamSrcs[key]) URL.revokeObjectURL(streamSrcs[key]);
-                        streamSrcs = { ...streamSrcs, [key]: url };
-                      }
-                    }, "image/jpeg", 0.7);
-                  }
-                }, 200);
+                // Remote camera — render the live MediaStream directly into a
+                // <video> element (smooth WebRTC video, no JPEG snapshotting).
+                const stream = streams[0] ?? new MediaStream([track]);
+                remoteVideos = { ...remoteVideos, [uid]: stream };
                 track.addEventListener("ended", () => {
-                  window.clearInterval(interval);
-                  video.srcObject = null;
+                  const { [uid]: _gone, ...rest } = remoteVideos;
+                  remoteVideos = rest;
                 });
               }
             },
@@ -296,6 +276,8 @@
             rtcMesh?.removePeer(id);
             remoteAudios[id]?.pause();
             delete remoteAudios[id];
+            const { [id]: _goneVideo, ...restVideos } = remoteVideos;
+            remoteVideos = restVideos;
           }
         } else if (message.shells) {
           shells = message.shells;
@@ -724,6 +706,10 @@
         rtcMesh?.addTrack(track);
       }
       cameraActive = true;
+      // Auto-enable mic on a video call so peers can talk right away.
+      if (!micRecording) {
+        await handleMicDown();
+      }
     } catch {
       makeToast({ kind: "error", message: "Camera blocked." });
     }
@@ -764,7 +750,6 @@
       {newMessages}
       {hasWriteAccess}
       {micRecording}
-      {streamActive}
       {cameraActive}
       on:create={handleCreate}
       on:chat={() => {
@@ -816,6 +801,16 @@
   {#if cameraActive && cameraStream}
     <CameraPreview stream={cameraStream} on:close={handleCamera} />
   {/if}
+
+  {#each Object.entries(remoteVideos) as [uid, stream], i (uid)}
+    <CameraPreview
+      {stream}
+      label={users.find(([u]) => String(u) === uid)?.[1]?.name ?? "Peer"}
+      mirror={false}
+      closable={false}
+      index={i + (cameraActive ? 1 : 0)}
+    />
+  {/each}
 
   <ChooseName />
 
