@@ -740,6 +740,7 @@
 <main
   class="p-8"
   class:cursor-nwse-resize={resizing !== -1}
+  style:background-color={$settings.background}
   on:wheel={(event) => event.preventDefault()}
 >
   <div

@@ -6,7 +6,10 @@ export type Settings = {
   name: string;
   theme: ThemeName;
   scrollback: number;
+  background: string; // board background color (CSS color string)
 };
+
+export const DEFAULT_BACKGROUND = "#0e0e10";
 
 const storedSettings = persisted<Partial<Settings>>("sshx-settings-store", {});
 
@@ -27,10 +30,17 @@ export const settings: Readable<Settings> = derived(
       scrollback = 5000;
     }
 
+    const background =
+      typeof $storedSettings.background === "string" &&
+      $storedSettings.background
+        ? $storedSettings.background
+        : DEFAULT_BACKGROUND;
+
     return {
       name,
       theme,
       scrollback,
+      background,
     };
   },
 );

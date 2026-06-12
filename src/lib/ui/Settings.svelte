@@ -10,6 +10,22 @@
   let inputName: string;
   let inputTheme: ThemeName;
   let inputScrollback: number;
+  let inputBackground: string;
+
+  // Quick board background presets.
+  const BG_PRESETS = [
+    { label: "Charcoal", value: "#0e0e10" },
+    { label: "Midnight", value: "#0b1220" },
+    { label: "Forest", value: "#0c1410" },
+    { label: "Plum", value: "#140d18" },
+    { label: "Slate", value: "#1a1d23" },
+    { label: "Black", value: "#000000" },
+  ];
+
+  function setBackground(value: string) {
+    inputBackground = value;
+    updateSettings({ background: value });
+  }
 
   let initialized = false;
   $: open, (initialized = false);
@@ -18,6 +34,7 @@
     inputName = $settings.name;
     inputTheme = $settings.theme;
     inputScrollback = $settings.scrollback;
+    inputBackground = $settings.background;
   }
 </script>
 
@@ -66,6 +83,31 @@
             <option value={themeName}>{themeName}</option>
           {/each}
         </select>
+      </div>
+    </div>
+    <div class="item">
+      <div>
+        <p class="item-title">Background</p>
+        <p class="item-subtitle">Board background color.</p>
+      </div>
+      <div class="flex flex-col gap-2 items-start">
+        <div class="flex gap-1.5 flex-wrap w-52">
+          {#each BG_PRESETS as preset}
+            <button
+              class="bg-swatch"
+              class:active={inputBackground === preset.value}
+              style:background-color={preset.value}
+              title={preset.label}
+              on:click={() => setBackground(preset.value)}
+            />
+          {/each}
+        </div>
+        <input
+          type="color"
+          class="color-input"
+          bind:value={inputBackground}
+          on:input={() => setBackground(inputBackground)}
+        />
       </div>
     </div>
     <div class="item">
@@ -125,5 +167,18 @@
     @apply w-52 px-3 py-2 text-sm rounded-md bg-transparent hover:bg-white/5;
     @apply border border-zinc-700 outline-none focus:ring-2 focus:ring-indigo-500/50;
     @apply appearance-none transition-colors;
+  }
+
+  .bg-swatch {
+    @apply w-7 h-7 rounded-md border border-zinc-600 transition-transform;
+    @apply hover:scale-110;
+  }
+
+  .bg-swatch.active {
+    @apply ring-2 ring-indigo-500 ring-offset-1 ring-offset-zinc-900;
+  }
+
+  .color-input {
+    @apply w-52 h-9 rounded-md border border-zinc-700 bg-transparent cursor-pointer p-1;
   }
 </style>
