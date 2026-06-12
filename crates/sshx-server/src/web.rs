@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, get_service};
 use axum::Router;
 use http::StatusCode;
@@ -38,7 +38,21 @@ async fn go_redirect() -> Response {
             if url.is_empty() {
                 (StatusCode::SERVICE_UNAVAILABLE, "no active session").into_response()
             } else {
-                Redirect::temporary(url).into_response()
+                // Wrap the live session in a full-page iframe so the browser
+                // address bar stays at `/go` (the session id + encryption key
+                // stay hidden inside the frame instead of redirecting the bar).
+                let safe = url.replace('"', "%22");
+                let html = format!(
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<title>Oracle Terminal</title>\
+<style>html,body{{margin:0;height:100%;background:#000}}\
+iframe{{border:0;width:100%;height:100%;display:block}}</style></head>\
+<body><iframe src=\"{safe}\" \
+allow=\"microphone; camera; display-capture; clipboard-read; clipboard-write; fullscreen\" \
+allowfullscreen></iframe></body></html>"
+                );
+                ([(http::header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+                    .into_response()
             }
         }
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "no active session").into_response(),
