@@ -38,6 +38,7 @@
   import Settings from "./ui/Settings.svelte";
   import Toolbar from "./ui/Toolbar.svelte";
   import XTerm from "./ui/XTerm.svelte";
+  import CameraPreview from "./ui/CameraPreview.svelte";
   import Avatars from "./ui/Avatars.svelte";
   import LiveCursor from "./ui/LiveCursor.svelte";
   import { slide } from "./action/slide";
@@ -809,6 +810,10 @@
   {/if}
 
   <Settings open={settingsOpen} on:close={() => (settingsOpen = false)} />
+
+  {#if cameraActive && cameraStream}
+    <CameraPreview stream={cameraStream} on:close={handleCamera} />
+  {/if}
 
   <ChooseName />
 
