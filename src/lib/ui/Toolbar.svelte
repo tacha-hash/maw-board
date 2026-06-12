@@ -4,6 +4,7 @@
   import {
     FileTextIcon,
     FilmIcon,
+    FolderIcon,
     GridIcon,
     ImageIcon,
     MessageSquareIcon,
@@ -27,6 +28,7 @@
     tile: void;
     note: void;
     video: void;
+    files: void;
     chat: void;
     settings: void;
     networkInfo: void;
@@ -70,6 +72,13 @@
         title="Tile terminals into a grid"
       >
         <GridIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+      <button
+        class="icon-button"
+        on:click={() => dispatch("files")}
+        title="File explorer"
+      >
+        <FolderIcon strokeWidth={1.5} class="p-0.5" />
       </button>
       <button class="icon-button" on:click={() => dispatch("chat")}>
         <MessageSquareIcon strokeWidth={1.5} class="p-0.5" />

@@ -39,6 +39,7 @@
   import Toolbar from "./ui/Toolbar.svelte";
   import XTerm from "./ui/XTerm.svelte";
   import CameraPreview from "./ui/CameraPreview.svelte";
+  import FileExplorer from "./ui/FileExplorer.svelte";
   import Avatars from "./ui/Avatars.svelte";
   import LiveCursor from "./ui/LiveCursor.svelte";
   import { slide } from "./action/slide";
@@ -78,6 +79,7 @@
 
   let showChat = false; // @hmr:keep
   let settingsOpen = false; // @hmr:keep
+  let showExplorer = false; // @hmr:keep
   let showNetworkInfo = false; // @hmr:keep
 
   onMount(() => {
@@ -858,6 +860,7 @@
       on:tile={tileWindows}
       on:note={addNote}
       on:video={handleVideoPick}
+      on:files={() => (showExplorer = !showExplorer)}
       on:chat={() => {
         showChat = !showChat;
         newMessages = false;
@@ -903,6 +906,10 @@
   {/if}
 
   <Settings open={settingsOpen} on:close={() => (settingsOpen = false)} />
+
+  {#if showExplorer}
+    <FileExplorer on:close={() => (showExplorer = false)} />
+  {/if}
 
   {#if cameraActive && cameraStream}
     <CameraPreview stream={cameraStream} on:close={handleCamera} />

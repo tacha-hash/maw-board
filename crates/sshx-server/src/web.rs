@@ -1,7 +1,10 @@
 //! HTTP and WebSocket handlers for the sshx web interface.
 
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use axum::extract::Query;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, get_service};
 use axum::Router;
@@ -72,6 +75,75 @@ fn backend() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/s/{name}", any(socket::get_session_ws))
         .route("/sysstat", get(sysstat))
+        .route("/files", get(list_files))
+}
+
+/// Read-only file browser root. Listing is confined to this directory; any
+/// attempt to escape it (via `..` or absolute components) is rejected.
+const FILES_ROOT: &str = "/root/maw-workspace";
+
+/// Resolve a caller-supplied relative path against FILES_ROOT, rejecting any
+/// component that could escape the root. Returns None if the path is unsafe.
+fn safe_join(rel: &str) -> Option<PathBuf> {
+    let root = Path::new(FILES_ROOT);
+    let mut out = root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            // Reject `..`, absolute, and prefix components outright.
+            _ => return None,
+        }
+    }
+    if out.starts_with(root) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// List a directory under FILES_ROOT for the IDE-style file explorer.
+async fn list_files(Query(params): Query<HashMap<String, String>>) -> Response {
+    let rel = params.get("path").map(String::as_str).unwrap_or("");
+    let Some(dir) = safe_join(rel) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    let mut read = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::NOT_FOUND, "not a directory").into_response(),
+    };
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
+    while let Ok(Some(entry)) = read.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // hide dotfiles (e.g. .git, .ssh-style noise)
+        }
+        let (is_dir, size) = match entry.metadata().await {
+            Ok(m) => (m.is_dir(), m.len()),
+            Err(_) => continue,
+        };
+        entries.push((name, is_dir, size));
+    }
+    // Directories first, then files, each alphabetical.
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(name, is_dir, size)| {
+            format!(
+                "{{\"name\":\"{}\",\"dir\":{},\"size\":{}}}",
+                name.replace('\\', "\\\\").replace('"', "\\\""),
+                is_dir,
+                size
+            )
+        })
+        .collect();
+    let body = format!("{{\"path\":\"{}\",\"items\":[{}]}}", rel.replace('"', ""), items.join(","));
+    (
+        [(http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// Sum of the non-idle and total CPU jiffies from the first line of /proc/stat.
