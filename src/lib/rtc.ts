@@ -16,7 +16,8 @@
 type SignalPayload =
   | { type: "offer"; sdp: string }
   | { type: "answer"; sdp: string }
-  | { type: "ice"; candidate: RTCIceCandidateInit };
+  | { type: "ice"; candidate: RTCIceCandidateInit }
+  | { type: "negotiate" };
 
 export type OnTrackCallback = (
   uid: number,
@@ -124,23 +125,37 @@ export class RtcMesh {
       await pc.setRemoteDescription({ type: "answer", sdp: payload.sdp });
     } else if (payload.type === "ice") {
       await pc.addIceCandidate(payload.candidate).catch(() => {});
+    } else if (payload.type === "negotiate") {
+      if (this.myUid > from) {
+        await this.createOffer(from, pc);
+      }
     }
   }
 
   /** Add a local media track (mic, camera, screen) to all current + future peers. */
   addTrack(track: MediaStreamTrack) {
     this.localTracks.push(track);
-    for (const [, pc] of this.peers) {
+    for (const [uid, pc] of this.peers) {
       pc.addTrack(track);
+      if (this.myUid > uid) {
+        this.createOffer(uid, pc);
+      } else {
+        this.sendSignal(uid, JSON.stringify({ type: "negotiate" }));
+      }
     }
   }
 
   /** Remove a local media track from all peers. */
   removeTrack(track: MediaStreamTrack) {
     this.localTracks = this.localTracks.filter((t) => t !== track);
-    for (const [, pc] of this.peers) {
+    for (const [uid, pc] of this.peers) {
       const sender = pc.getSenders().find((s) => s.track === track);
       if (sender) pc.removeTrack(sender);
+      if (this.myUid > uid) {
+        this.createOffer(uid, pc);
+      } else {
+        this.sendSignal(uid, JSON.stringify({ type: "negotiate" }));
+      }
     }
   }
 
