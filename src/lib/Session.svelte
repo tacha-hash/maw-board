@@ -13,8 +13,23 @@
   import { Encrypt } from "./encrypt";
   import { createLock } from "./lock";
   import { Srocket } from "./srocket";
-  import type { WsClient, WsServer, WsUser, WsWinsize } from "./protocol";
+  import type {
+    BoardItem,
+    WsClient,
+    WsServer,
+    WsUser,
+    WsWinsize,
+  } from "./protocol";
+  import {
+    createVoiceCapture,
+    playVoice,
+    readImageFile,
+    startScreenShare,
+    type StreamController,
+    type VoiceController,
+  } from "./board";
   import { makeToast } from "./toast";
+  import Board from "./ui/Board.svelte";
   import Chat, { type ChatMessage } from "./ui/Chat.svelte";
   import ChooseName from "./ui/ChooseName.svelte";
   import NameList from "./ui/NameList.svelte";
@@ -126,6 +141,50 @@
   let chatMessages: ChatMessage[] = [];
   let newMessages = false;
 
+  // ── maw share workboard extensions ──
+  let boardItems: BoardItem[] = [];
+  // Live screen-share frames as object URLs, keyed by board item id.
+  let streamSrcs: Record<string, string> = {};
+  let voice: VoiceController | null = null;
+  let micRecording = false;
+  let stream: StreamController | null = null;
+  let streamActive = false;
+  let myStreamId: string | null = null;
+
+  /** Insert or replace a board item by id. */
+  function upsertBoardItem(item: BoardItem) {
+    const idx = boardItems.findIndex((it) => it.id === item.id);
+    if (idx === -1) boardItems = [...boardItems, item];
+    else {
+      boardItems[idx] = item;
+      boardItems = boardItems;
+    }
+  }
+
+  /** Remove a board item and release any live stream frame URL. */
+  function removeBoardItem(id: string) {
+    boardItems = boardItems.filter((it) => it.id !== id);
+    if (streamSrcs[id]) {
+      URL.revokeObjectURL(streamSrcs[id]);
+      delete streamSrcs[id];
+      streamSrcs = streamSrcs;
+    }
+  }
+
+  /** Update the live frame shown for a stream tile. */
+  function setStreamFrame(id: string, bytes: Uint8Array) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+    if (streamSrcs[id]) URL.revokeObjectURL(streamSrcs[id]);
+    streamSrcs = { ...streamSrcs, [id]: url };
+  }
+
+  /** A world-space position near the current view center for new board items. */
+  function nextBoardPos(): [number, number] {
+    const ox = ((boardItems.length * 28) % 200) - 100;
+    const oy = ((boardItems.length * 22) % 160) - 80;
+    return [Math.round(center[0] + ox), Math.round(center[1] + oy)];
+  }
+
   let serverLatencies: number[] = [];
   let shellLatencies: number[] = [];
 
@@ -196,6 +255,21 @@
           chatMessages.push({ uid, name, msg, sentAt: new Date() });
           chatMessages = chatMessages;
           if (!showChat) newMessages = true;
+        } else if (message.voiceData) {
+          playVoice(message.voiceData[1]);
+        } else if (message.streamFrame) {
+          const [, streamId, bytes] = message.streamFrame;
+          setStreamFrame(streamId, bytes);
+        } else if (message.board) {
+          boardItems = message.board;
+        } else if (message.boardPut) {
+          upsertBoardItem(message.boardPut);
+        } else if (message.boardMove) {
+          const [id, x, y] = message.boardMove;
+          const item = boardItems.find((it) => it.id === id);
+          if (item) upsertBoardItem({ ...item, x, y });
+        } else if (message.boardDelete) {
+          removeBoardItem(message.boardDelete);
         } else if (message.shellLatency !== undefined) {
           const shellLatency = Number(message.shellLatency);
           shellLatencies = [...shellLatencies, shellLatency].slice(-10);
@@ -388,6 +462,142 @@
   const setFocus = debounce((focused: number[]) => {
     srocket?.send({ setFocus: focused[0] ?? null });
   }, 20);
+
+  // ── maw share workboard handlers ──
+
+  // Push-to-talk: press starts a clip, release (anywhere) ends and sends it.
+  function handleMicDown() {
+    if (!voice) voice = createVoiceCapture((bytes) => srocket?.send({ voice: bytes }));
+    voice
+      .start()
+      .then(() => (micRecording = true))
+      .catch(() => makeToast({ kind: "error", message: "Microphone blocked." }));
+  }
+
+  onMount(() => {
+    const stopTalk = () => {
+      if (voice?.recording) {
+        voice.stop();
+        micRecording = false;
+      }
+    };
+    window.addEventListener("pointerup", stopTalk);
+    return () => window.removeEventListener("pointerup", stopTalk);
+  });
+
+  // Add an image to the board (file picker, paste, or drag-and-drop).
+  function addImage(file: File) {
+    if (hasWriteAccess === false) return;
+    readImageFile(file, (dataUrl, w, h) => {
+      const [x, y] = nextBoardPos();
+      const item: BoardItem = {
+        id: crypto.randomUUID(),
+        kind: "image",
+        x,
+        y,
+        w,
+        h,
+        dataUrl,
+      };
+      upsertBoardItem(item);
+      srocket?.send({ boardPut: item });
+    });
+  }
+
+  function handleImage() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.multiple = true;
+    input.onchange = () => {
+      for (const file of input.files ?? []) addImage(file);
+    };
+    input.click();
+  }
+
+  onMount(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      for (const item of event.clipboardData?.items ?? []) {
+        if (item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) addImage(file);
+        }
+      }
+    };
+    const onDragOver = (event: DragEvent) => event.preventDefault();
+    const onDrop = (event: DragEvent) => {
+      event.preventDefault();
+      for (const file of event.dataTransfer?.files ?? []) addImage(file);
+    };
+    window.addEventListener("paste", onPaste);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("paste", onPaste);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  });
+
+  // Screen share: place a placeholder tile, then stream frames to it at ~3 fps.
+  async function handleStream() {
+    if (hasWriteAccess === false) return;
+    if (stream) {
+      stopStream();
+      return;
+    }
+    const id = crypto.randomUUID();
+    const [x, y] = nextBoardPos();
+    const placeholder: BoardItem = {
+      id,
+      kind: "stream",
+      x,
+      y,
+      w: 480,
+      h: 270,
+      dataUrl: "",
+    };
+    const controller = await startScreenShare(
+      (bytes) => {
+        setStreamFrame(id, bytes); // show my own share locally
+        srocket?.send({ streamFrame: [id, bytes] });
+      },
+      () => stopStream(), // browser's own "Stop sharing" control
+    );
+    if (!controller) return; // user cancelled the picker
+    stream = controller;
+    myStreamId = id;
+    streamActive = true;
+    upsertBoardItem(placeholder);
+    srocket?.send({ boardPut: placeholder });
+  }
+
+  function stopStream() {
+    stream?.stop();
+    stream = null;
+    streamActive = false;
+    if (myStreamId) {
+      srocket?.send({ boardDelete: myStreamId });
+      removeBoardItem(myStreamId);
+      myStreamId = null;
+    }
+  }
+
+  function handleBoardMove(id: string, x: number, y: number) {
+    const item = boardItems.find((it) => it.id === id);
+    if (item) upsertBoardItem({ ...item, x, y });
+    srocket?.send({ boardMove: [id, x, y] });
+  }
+
+  function handleBoardDelete(id: string) {
+    removeBoardItem(id);
+    srocket?.send({ boardDelete: id });
+  }
+
+  onDestroy(() => {
+    stream?.stop();
+    for (const url of Object.values(streamSrcs)) URL.revokeObjectURL(url);
+  });
 </script>
 
 <!-- Wheel handler stops native macOS Chrome zooming on pinch. -->
@@ -403,6 +613,8 @@
       {connected}
       {newMessages}
       {hasWriteAccess}
+      {micRecording}
+      {streamActive}
       on:create={handleCreate}
       on:chat={() => {
         showChat = !showChat;
@@ -414,6 +626,9 @@
       on:networkInfo={() => {
         showNetworkInfo = !showNetworkInfo;
       }}
+      on:micDown={handleMicDown}
+      on:image={handleImage}
+      on:stream={handleStream}
     />
 
     {#if showNetworkInfo}
@@ -484,6 +699,21 @@
   </div>
 
   <div class="absolute inset-0 overflow-hidden touch-none" bind:this={fabricEl}>
+    <Board
+      items={boardItems}
+      {streamSrcs}
+      {center}
+      {zoom}
+      {hasWriteAccess}
+      offsetLeftCss={OFFSET_LEFT_CSS}
+      offsetTopCss={OFFSET_TOP_CSS}
+      offsetTransformOriginCss={OFFSET_TRANSFORM_ORIGIN_CSS}
+      {normalizePosition}
+      on:move={({ detail }) =>
+        handleBoardMove(detail.id, detail.x, detail.y)}
+      on:delete={({ detail }) => handleBoardDelete(detail)}
+    />
+
     {#each shells as [id, winsize] (id)}
       {@const ws = id === moving ? movingSize : winsize}
       <div
