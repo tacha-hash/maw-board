@@ -1320,7 +1320,7 @@
       {streamSrcs}
       {center}
       {zoom}
-      {hasWriteAccess}
+      hasWriteAccess={canEdit}
       offsetLeftCss={OFFSET_LEFT_CSS}
       offsetTopCss={OFFSET_TOP_CSS}
       offsetTransformOriginCss={OFFSET_TRANSFORM_ORIGIN_CSS}
@@ -1409,6 +1409,7 @@
           class="absolute w-5 h-5 -bottom-1 -right-1 cursor-nwse-resize touch-none"
           on:pointerdown={(event) => {
             event.stopPropagation();
+            if (!canEdit) return;
             const canvasEl = termElements[id].querySelector(".xterm-screen");
             if (canvasEl) {
               resizing = id;
