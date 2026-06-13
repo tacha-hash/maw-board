@@ -2,7 +2,9 @@
   import { createEventDispatcher } from "svelte";
   import StatusBar from "./StatusBar.svelte";
   import LayoutMenu from "./LayoutMenu.svelte";
+  import OracleBoardMenu from "./OracleBoardMenu.svelte";
   import {
+    ChevronDownIcon,
     ChevronLeftIcon,
     ChevronRightIcon,
     CrosshairIcon,
@@ -59,13 +61,23 @@
 
   let collapsed = false;
   let showTileMenu = false;
+  let brandMenuOpen = false;
 </script>
 
 <div class="panel inline-block px-3 py-2">
   <div class="flex items-center select-none">
-    <div class="brand">
-      <TerminalIcon size="18" strokeWidth={2} />
-      <span>Oracle Board</span>
+    <div class="brand-wrap">
+      <button
+        class="brand"
+        class:open={brandMenuOpen}
+        on:click={() => (brandMenuOpen = !brandMenuOpen)}
+        title="Oracle Board — system monitor"
+      >
+        <TerminalIcon size="18" strokeWidth={2} />
+        <span>Oracle Board</span>
+        <ChevronDownIcon size="14" strokeWidth={2} class="chev" />
+      </button>
+      <OracleBoardMenu open={brandMenuOpen} />
     </div>
 
     <div class="v-divider" />
@@ -252,8 +264,21 @@
 </div>
 
 <style lang="postcss">
+  .brand-wrap {
+    @apply relative;
+  }
   .brand {
     @apply flex items-center gap-1.5 text-indigo-400 font-semibold text-sm tracking-tight;
+    @apply rounded-lg px-1.5 py-1 hover:bg-zinc-800/70 transition-colors;
+  }
+  .brand.open {
+    @apply bg-zinc-800 text-indigo-300;
+  }
+  .brand :global(.chev) {
+    @apply text-zinc-500 transition-transform duration-200;
+  }
+  .brand.open :global(.chev) {
+    @apply rotate-180 text-indigo-300;
   }
 
   .v-divider {
