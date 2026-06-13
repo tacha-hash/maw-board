@@ -219,10 +219,11 @@ export class TouchZoom {
           [y, 0]
         : // scroll = pan vertically (or in any direction on a trackpad)
           [x, y],
-      // 1:1 with finger/mouse drag (#handleDrag) so desktop trackpad/wheel pan
-      // covers the same world distance as mobile drag — the old 0.5 made desktop
-      // pan half as far, so the two felt out of sync. (Bo 2026-06-13)
-      1.0,
+      // 0.5 is the upstream author's intentional trackpad/wheel tuning (orig
+      // commit 6a0b9dd). Wheel/scroll and grab-drag are different input
+      // modalities and are deliberately tuned separately — do NOT "fix" this to
+      // match drag. (Reverted a mis-fix 2026-06-13; Bo: check the original.)
+      0.5,
     );
 
     if (Vec.isEqual(delta, [0, 0])) return;
