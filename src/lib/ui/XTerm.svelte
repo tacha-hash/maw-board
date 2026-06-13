@@ -189,10 +189,23 @@
     });
 
     term.loadAddon(new WebLinksAddon());
-    term.loadAddon(new WebglAddon());
     term.loadAddon(new ImageAddon({ enableSizeReports: false }));
 
     term.open(termEl);
+
+    // WebGL renderer AFTER open(), wrapped — iOS/iPadOS Safari caps live WebGL
+    // contexts (~8–16/page), so on a board with many terminals the overflow
+    // ones fail to get a context. If that throw happens during open() the whole
+    // terminal breaks (blank/white or header-only); loading WebGL separately and
+    // catching lets those terminals fall back to xterm's DOM renderer and still
+    // render. onContextLoss handles a context dropped later at runtime.
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
+    } catch {
+      // No WebGL available — xterm keeps its default (DOM) renderer.
+    }
 
     term.resize(cols, rows);
     term.onTitleChange((title) => {
