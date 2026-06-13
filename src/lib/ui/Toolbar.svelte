@@ -199,13 +199,21 @@
       >
         <Edit2Icon strokeWidth={1.5} class="p-0.5" />
       </button>
-      <button class="icon-button" on:click={() => dispatch("chat")}>
+      <button
+        class="icon-button"
+        on:click={() => dispatch("chat")}
+        title="Chat"
+      >
         <MessageSquareIcon strokeWidth={1.5} class="p-0.5" />
         {#if newMessages}
           <div class="activity" />
         {/if}
       </button>
-      <button class="icon-button" on:click={() => dispatch("settings")}>
+      <button
+        class="icon-button"
+        on:click={() => dispatch("settings")}
+        title="Settings"
+      >
         <SettingsIcon strokeWidth={1.5} class="p-0.5" />
       </button>
     </div>

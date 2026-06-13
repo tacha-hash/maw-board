@@ -738,6 +738,19 @@
   // rejected -> board desync. Require an explicit `true`.
   $: canEdit = hasWriteAccess === true && !lockedForMe;
 
+  // Apply the user's panel/header color (Settings) as a CSS variable that
+  // `.panel` reads; empty value falls back to the built-in default.
+  $: if (typeof document !== "undefined") {
+    if ($settings.panelBackground) {
+      document.documentElement.style.setProperty(
+        "--panel-bg",
+        $settings.panelBackground,
+      );
+    } else {
+      document.documentElement.style.removeProperty("--panel-bg");
+    }
+  }
+
   function toggleLock() {
     if (hasWriteAccess === false) {
       makeToast({

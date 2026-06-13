@@ -98,6 +98,7 @@
     // If the theme changes, update existing terminals' appearance.
     term.options.theme = theme;
     term.options.scrollback = $settings.scrollback;
+    term.options.fontSize = $settings.fontSize;
   }
 
   let loaded = false;
@@ -160,7 +161,7 @@
       // This is the monospace font family configured in Tailwind.
       fontFamily:
         '"Fira Code VF", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-      fontSize: 14,
+      fontSize: $settings.fontSize,
       fontWeight: 400,
       fontWeightBold: 500,
       lineHeight: 1.06,

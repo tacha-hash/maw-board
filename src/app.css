@@ -19,7 +19,9 @@
 
 @layer components {
   .panel {
-    @apply border border-zinc-800 bg-zinc-900/90 backdrop-blur-md rounded-2xl pointer-events-auto;
+    @apply border border-zinc-800 backdrop-blur-md rounded-2xl pointer-events-auto;
     @apply shadow-lg shadow-black/25;
+    /* Panel/header color — overridable via Settings (--panel-bg). */
+    background-color: var(--panel-bg, rgb(24 24 27 / 0.9));
   }
 }

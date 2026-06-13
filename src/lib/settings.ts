@@ -6,7 +6,9 @@ export type Settings = {
   name: string;
   theme: ThemeName;
   scrollback: number;
+  fontSize: number; // terminal font size in px
   background: string; // board background color (CSS color string)
+  panelBackground: string; // panel/header background color (CSS color string)
   tileCols: number; // remembered custom column count for the layout menu
   snippets: string[]; // saved command snippets, click-to-paste into a terminal
 };
@@ -33,11 +35,21 @@ export const settings: Readable<Settings> = derived(
       scrollback = 5000;
     }
 
+    let fontSize = $storedSettings.fontSize;
+    if (typeof fontSize !== "number" || fontSize < 8 || fontSize > 40) {
+      fontSize = 14;
+    }
+
     const background =
       typeof $storedSettings.background === "string" &&
       $storedSettings.background
         ? $storedSettings.background
         : DEFAULT_BACKGROUND;
+
+    const panelBackground =
+      typeof $storedSettings.panelBackground === "string"
+        ? $storedSettings.panelBackground
+        : "";
 
     let tileCols = $storedSettings.tileCols;
     if (typeof tileCols !== "number" || tileCols < 1 || tileCols > 8) {
@@ -52,7 +64,9 @@ export const settings: Readable<Settings> = derived(
       name,
       theme,
       scrollback,
+      fontSize,
       background,
+      panelBackground,
       tileCols,
       snippets,
     };
