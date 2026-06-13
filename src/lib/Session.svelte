@@ -181,6 +181,7 @@
   let chatMessages: ChatMessage[] = [];
   let newMessages = false;
   let initialShellsReceived = false;
+  let didInitialFit = false; // auto-fit the view once on first load
   // Set when we joined a fresh empty session before write-perms were known, so
   // the auto-create can fire once canWrite arrives (handleCreate needs canEdit).
   let autoCreatePending = false;
@@ -771,6 +772,13 @@
   // rejected -> board desync. Require an explicit `true`.
   $: canEdit = hasWriteAccess === true && !lockedForMe;
 
+  // Auto-fit the view once on first load (after terminals have rendered so their
+  // world sizes are real), so every device opens centered + everything visible.
+  $: if (!didInitialFit && initialShellsReceived && shells.length > 0) {
+    didInitialFit = true;
+    setTimeout(() => fitToContent(), 350);
+  }
+
   // Fire the deferred auto-create once write-perms arrive (still empty board),
   // or drop it if perms came back read-only / someone else already created one.
   $: if (autoCreatePending) {
@@ -960,13 +968,26 @@
         else addImage(file);
       }
     };
+    // Re-fit on rotate (the main "responsive" trigger on tablets/phones).
+    // Debounced + skipped while the user is mid-drag/resize so we don't fight
+    // a manual interaction.
+    let fitTimer: ReturnType<typeof setTimeout> | null = null;
+    const onOrient = () => {
+      if (fitTimer) clearTimeout(fitTimer);
+      fitTimer = setTimeout(() => {
+        if (moving === -1 && resizing === -1) fitToContent();
+      }, 300);
+    };
     window.addEventListener("paste", onPaste);
     window.addEventListener("dragover", onDragOver);
     window.addEventListener("drop", onDrop);
+    window.addEventListener("orientationchange", onOrient);
     return () => {
       window.removeEventListener("paste", onPaste);
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("drop", onDrop);
+      window.removeEventListener("orientationchange", onOrient);
+      if (fitTimer) clearTimeout(fitTimer);
     };
   });
 
@@ -1170,9 +1191,51 @@
     touchZoom.moveTo([0, 0], Math.max(0.25, Math.min(1, fit)));
   }
 
-  // Reset the view back to the origin.
+  // Fit every window/item into THIS viewport, centered — a local view change
+  // (zoom + pan only), so it never moves the shared world positions and never
+  // disturbs other devices. This is the responsive "see everything, centered"
+  // that makes one shared layout look right on any screen size. (Bo 2026-06-13)
+  function fitToContent() {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    const add = (x: number, y: number, w: number, h: number) => {
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + w);
+      maxY = Math.max(maxY, y + h);
+    };
+    for (const [id, ws] of shells) {
+      const el = termWrappers[id];
+      if (!el || el.offsetWidth <= 0) continue;
+      add(ws.x, ws.y, el.offsetWidth, el.offsetHeight); // offsetW/H = world px
+    }
+    for (const it of boardItems) {
+      if (it.kind === "doc" || it.kind === "lock" || it.kind === "label") continue;
+      if (!it.w || !it.h) continue;
+      add(it.x, it.y, it.w, it.h);
+    }
+    if (!isFinite(minX)) {
+      touchZoom.moveTo([0, 0], INITIAL_ZOOM); // empty board
+      return;
+    }
+    const PAD = 80; // breathing room around the content (screen px)
+    const w = maxX - minX;
+    const h = maxY - minY;
+    const fit = Math.min(
+      window.innerWidth / (w + PAD * 2),
+      window.innerHeight / (h + PAD * 2),
+    );
+    touchZoom.moveTo(
+      [(minX + maxX) / 2, (minY + maxY) / 2],
+      Math.max(0.2, Math.min(1, fit)),
+    );
+  }
+
+  // Center button → fit everything centered (was: reset to origin).
   function handleCenter() {
-    touchZoom.moveTo([0, 0], INITIAL_ZOOM);
+    fitToContent();
   }
 
   // Clear the board — remove notes/images/videos/streams (keeps terminals and
