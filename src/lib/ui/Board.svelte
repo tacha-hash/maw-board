@@ -38,6 +38,7 @@
   let resizeStartH = 0;
   let resizeStartWorld = [0, 0];
   let resizePending = false;
+  let latestResizeEvent: PointerEvent | null = null;
 
   function startResize(event: PointerEvent, item: BoardItem) {
     if (hasWriteAccess === false) return;
@@ -49,6 +50,7 @@
     resizeStartWorld = normalizePosition(event);
     window.addEventListener("pointermove", onResize);
     window.addEventListener("pointerup", endResize);
+    window.addEventListener("pointercancel", endResize);
   }
 
   function currentResize(event: PointerEvent) {
@@ -60,12 +62,15 @@
 
   function onResize(event: PointerEvent) {
     if (resizeId === null) return;
-    const { w, h } = currentResize(event);
+    latestResizeEvent = event; // use the freshest sample inside the frame
     if (!resizePending) {
       resizePending = true;
       requestAnimationFrame(() => {
         resizePending = false;
-        if (resizeId !== null) dispatch("resize", { id: resizeId, w, h });
+        if (resizeId !== null && latestResizeEvent) {
+          const { w, h } = currentResize(latestResizeEvent);
+          dispatch("resize", { id: resizeId, w, h });
+        }
       });
     }
   }
@@ -76,8 +81,10 @@
       dispatch("resize", { id: resizeId, w, h });
     }
     resizeId = null;
+    latestResizeEvent = null;
     window.removeEventListener("pointermove", onResize);
     window.removeEventListener("pointerup", endResize);
+    window.removeEventListener("pointercancel", endResize);
   }
 
   // Drag state. While dragging, the dragged tile renders at `dragPos` and sends
