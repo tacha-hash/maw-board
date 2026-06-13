@@ -31,6 +31,7 @@
   import {
     computeSnap,
     computeSnapTarget,
+    detectEdgeSnapAction,
     type SnapRect,
     type SnapAction,
     type ViewRect,
@@ -73,6 +74,8 @@
   // Terminal width and height limits.
   const TERM_MIN_ROWS = 8;
   const TERM_MIN_COLS = 32;
+  const TERM_MAX_ROWS = 200;
+  const TERM_MAX_COLS = 500;
 
   function getConstantOffset() {
     return [
@@ -149,6 +152,18 @@
     ];
   }
 
+  function isCoarsePointer() {
+    return (
+      typeof matchMedia === "function" &&
+      matchMedia("(hover: none), (pointer: coarse)").matches
+    );
+  }
+
+  function clampInt(value: number, min: number, max: number) {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, Math.floor(value)));
+  }
+
   let encrypt: Encrypt;
   let srocket: Srocket<WsServer, WsClient> | null = null;
 
@@ -179,6 +194,8 @@
   const SNAP_PX = 8; // screen-space pull distance (÷ zoom → world units)
   let termGuidesV: number[] = []; // active guide lines while dragging a terminal
   let termGuidesH: number[] = [];
+  let edgeSnapPreview: ViewRect | null = null;
+  let pendingEdgeSnap: { id: number; action: SnapAction } | null = null;
 
   let resizing = -1; // Terminal ID that is being resized.
   let resizingPointerId: number | null = null; // Track pointer ID during resize gesture.
@@ -646,6 +663,33 @@
           termGuidesV = r.guidesV;
           termGuidesH = r.guidesH;
         }
+        const edgeAction = detectEdgeSnapAction(
+          event.clientX,
+          event.clientY,
+          { w: window.innerWidth, h: window.innerHeight },
+          { coarse: isCoarsePointer() },
+        );
+        if (edgeAction) {
+          const view = visibleWorldRect();
+          edgeSnapPreview = computeSnapTarget(edgeAction, view, {
+            x: nx,
+            y: ny,
+            w:
+              el && el.offsetWidth > 0
+                ? el.offsetWidth
+                : movingSize.cols * 9.6 + 36,
+            h:
+              el && el.offsetHeight > 0
+                ? el.offsetHeight
+                : movingSize.rows * 19 + 60,
+          });
+          pendingEdgeSnap = { id: moving, action: edgeAction };
+          termGuidesV = [];
+          termGuidesH = [];
+        } else {
+          edgeSnapPreview = null;
+          pendingEdgeSnap = null;
+        }
         movingSize = { ...movingSize, x: nx, y: ny };
         sendMove({ move: [moving, movingSize] });
       }
@@ -678,7 +722,15 @@
         }
         movingIsDone = true;
         sendMove.cancel();
-        srocket?.send({ move: [moving, movingSize] });
+        const edgeSnap =
+          pendingEdgeSnap?.id === moving ? pendingEdgeSnap : null;
+        if (edgeSnap && event.type !== "pointercancel") {
+          void applySnap(moving, edgeSnap.action, false);
+        } else {
+          srocket?.send({ move: [moving, movingSize] });
+        }
+        edgeSnapPreview = null;
+        pendingEdgeSnap = null;
         termGuidesV = [];
         termGuidesH = [];
         movingPointerId = null;
@@ -709,6 +761,8 @@
       window.removeEventListener("pointerup", handleMouseEnd);
       window.removeEventListener("pointercancel", handleMouseEnd);
       document.body.removeEventListener("pointerleave", handleMouseEnd);
+      edgeSnapPreview = null;
+      pendingEdgeSnap = null;
     };
   });
 
@@ -1242,17 +1296,19 @@
   // Snap one terminal into a region of the visible viewport (Rectangle-style),
   // resizing its rows/cols to fill the target. Only the final shared `move` is
   // sent; gated by canEdit like every other layout mutation.
-  async function applySnap(id: number, action: string) {
+  async function applySnap(id: number, action: SnapAction, settle = true) {
+    if (!canEdit) return;
+    if (settle) await settleLayout(); // don't measure stale geometry after a font-size change
     if (!canEdit) return;
     const ws = shells.find(([sid]) => sid === id)?.[1];
     if (!ws) return;
-    await settleLayout(); // don't measure stale geometry after a font-size change
     const view = visibleWorldRect();
     // Current footprint — real when laid out, cols×cell estimate as fallback.
     const el = termWrappers[id];
     const curW = el && el.offsetWidth > 0 ? el.offsetWidth : ws.cols * 9.6 + 36;
-    const curH = el && el.offsetHeight > 0 ? el.offsetHeight : ws.rows * 19 + 60;
-    const target = computeSnapTarget(action as SnapAction, view, {
+    const curH =
+      el && el.offsetHeight > 0 ? el.offsetHeight : ws.rows * 19 + 60;
+    const target = computeSnapTarget(action, view, {
       x: ws.x,
       y: ws.y,
       w: curW,
@@ -1268,19 +1324,30 @@
     if (screenEl && zoom && ws.cols && ws.rows) {
       const r = screenEl.getBoundingClientRect();
       if (r.width && r.height) {
-        cellW = r.width / ws.cols / zoom;
-        cellH = r.height / ws.rows / zoom;
+        const measuredW = r.width / ws.cols / zoom;
+        const measuredH = r.height / ws.rows / zoom;
+        if (
+          Number.isFinite(measuredW) &&
+          Number.isFinite(measuredH) &&
+          measuredW > 2 &&
+          measuredH > 6
+        ) {
+          cellW = measuredW;
+          cellH = measuredH;
+        }
       }
     }
     const CHROME_W = 36;
     const CHROME_H = 60;
-    const cols = Math.max(
+    const cols = clampInt(
+      (target.w - CHROME_W) / cellW,
       TERM_MIN_COLS,
-      Math.floor((target.w - CHROME_W) / cellW),
+      TERM_MAX_COLS,
     );
-    const rows = Math.max(
+    const rows = clampInt(
+      (target.h - CHROME_H) / cellH,
       TERM_MIN_ROWS,
-      Math.floor((target.h - CHROME_H) / cellH),
+      TERM_MAX_ROWS,
     );
     srocket?.send({
       move: [
@@ -1288,6 +1355,10 @@
         { ...ws, x: Math.round(target.x), y: Math.round(target.y), cols, rows },
       ],
     });
+  }
+
+  function handleSnapButton(id: number, action: string) {
+    void applySnap(id, action as SnapAction);
   }
 
   // Tile all open terminals into a uniform layout and recenter on it.
@@ -1778,6 +1849,24 @@
       on:edit={({ detail }) => handleNoteEdit(detail.id, detail.text)}
     />
 
+    {#if edgeSnapPreview}
+      <div
+        class="pointer-events-none absolute z-20 rounded-xl border border-indigo-300/80 bg-indigo-500/20 shadow-[0_0_0_1px_rgba(99,102,241,0.28),0_16px_48px_rgba(79,70,229,0.22)]"
+        style:left={OFFSET_LEFT_CSS}
+        style:top={OFFSET_TOP_CSS}
+        style:width={`${Math.max(0, edgeSnapPreview.w)}px`}
+        style:height={`${Math.max(0, edgeSnapPreview.h)}px`}
+        style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+        use:slide={{
+          x: edgeSnapPreview.x,
+          y: edgeSnapPreview.y,
+          center,
+          zoom,
+          immediate: true,
+        }}
+      />
+    {/if}
+
     {#each shells as [id, winsize] (id)}
       {@const ws = id === moving ? movingSize : winsize}
       <div
@@ -1819,7 +1908,7 @@
             const c = Math.max(cols, TERM_MIN_COLS);
             srocket?.send({ move: [id, { ...ws, rows: r, cols: c }] });
           }}
-          on:snap={({ detail }) => applySnap(id, detail)}
+          on:snap={({ detail }) => handleSnapButton(id, detail)}
           on:bringToFront={() => {
             if (!canEdit) return;
             showNetworkInfo = false;

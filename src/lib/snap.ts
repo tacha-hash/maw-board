@@ -135,6 +135,48 @@ export interface ViewRect {
   h: number;
 }
 
+export interface ViewportPx {
+  w: number;
+  h: number;
+}
+
+export interface EdgeSnapOptions {
+  coarse?: boolean;
+}
+
+/**
+ * Detect Rectangle-style drag-to-edge snap actions from viewport/client pixels.
+ * Activation is intentionally screen-space: touch users need a wider edge zone,
+ * and the trigger should not change with board zoom.
+ */
+export function detectEdgeSnapAction(
+  clientX: number,
+  clientY: number,
+  viewport: ViewportPx,
+  options: EdgeSnapOptions = {},
+): SnapAction | null {
+  if (viewport.w <= 0 || viewport.h <= 0) return null;
+
+  const coarse = options.coarse ?? false;
+  const edge = coarse ? 32 : 14;
+  const corner = coarse ? 84 : 48;
+
+  const x = Math.max(0, Math.min(viewport.w, clientX));
+  const y = Math.max(0, Math.min(viewport.h, clientY));
+
+  if (x <= corner && y <= corner) return "topLeft";
+  if (x >= viewport.w - corner && y <= corner) return "topRight";
+  if (x <= corner && y >= viewport.h - corner) return "bottomLeft";
+  if (x >= viewport.w - corner && y >= viewport.h - corner)
+    return "bottomRight";
+
+  if (y <= edge) return "maximize";
+  if (x <= edge) return "leftHalf";
+  if (x >= viewport.w - edge) return "rightHalf";
+  if (y >= viewport.h - edge) return "bottomHalf";
+  return null;
+}
+
 /**
  * @param action  which snap layout to apply
  * @param view    the visible viewport as a world rect
