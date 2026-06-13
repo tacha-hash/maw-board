@@ -44,19 +44,29 @@ export function computeSnap(
   const cx = left + width / 2;
   const cy = top + height / 2;
 
-  let bestX: { delta: number; guide: number } | null = null;
-  let bestY: { delta: number; guide: number } | null = null;
+  // Scalars (not a nullable object) so TS control-flow doesn't choke on the
+  // closures mutating an outer union — npm run check narrowed it to `never`.
+  let hasX = false;
+  let bestXDelta = 0;
+  let bestXGuide = 0;
+  let hasY = false;
+  let bestYDelta = 0;
+  let bestYGuide = 0;
 
   const considerX = (movingEdge: number, target: number) => {
     const d = target - movingEdge;
-    if (Math.abs(d) <= threshold && (!bestX || Math.abs(d) < Math.abs(bestX.delta))) {
-      bestX = { delta: d, guide: target };
+    if (Math.abs(d) <= threshold && (!hasX || Math.abs(d) < Math.abs(bestXDelta))) {
+      hasX = true;
+      bestXDelta = d;
+      bestXGuide = target;
     }
   };
   const considerY = (movingEdge: number, target: number) => {
     const d = target - movingEdge;
-    if (Math.abs(d) <= threshold && (!bestY || Math.abs(d) < Math.abs(bestY.delta))) {
-      bestY = { delta: d, guide: target };
+    if (Math.abs(d) <= threshold && (!hasY || Math.abs(d) < Math.abs(bestYDelta))) {
+      hasY = true;
+      bestYDelta = d;
+      bestYGuide = target;
     }
   };
 
@@ -88,13 +98,13 @@ export function computeSnap(
   const guidesH: number[] = [];
   let nx = left;
   let ny = top;
-  if (bestX) {
-    nx = left + bestX.delta;
-    guidesV.push(bestX.guide);
+  if (hasX) {
+    nx = left + bestXDelta;
+    guidesV.push(bestXGuide);
   }
-  if (bestY) {
-    ny = top + bestY.delta;
-    guidesH.push(bestY.guide);
+  if (hasY) {
+    ny = top + bestYDelta;
+    guidesH.push(bestYGuide);
   }
   return { x: nx, y: ny, guidesV, guidesH };
 }

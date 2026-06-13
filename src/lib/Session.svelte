@@ -181,6 +181,9 @@
   let chatMessages: ChatMessage[] = [];
   let newMessages = false;
   let initialShellsReceived = false;
+  // Set when we joined a fresh empty session before write-perms were known, so
+  // the auto-create can fire once canWrite arrives (handleCreate needs canEdit).
+  let autoCreatePending = false;
 
   // ── maw share workboard extensions ──
   let boardItems: BoardItem[] = [];
@@ -322,9 +325,12 @@
           if (movingIsDone) {
             moving = -1;
           }
-          // Auto-create one terminal when joining a fresh empty session.
-          if (!initialShellsReceived && message.shells.length === 0 && hasWriteAccess !== false) {
-            handleCreate();
+          // Auto-create one terminal when joining a fresh empty session. If
+          // write-perms aren't known yet (undefined), defer — handleCreate needs
+          // canEdit===true, and a premature call both no-ops and toasts.
+          if (!initialShellsReceived && message.shells.length === 0) {
+            if (hasWriteAccess === true) handleCreate();
+            else if (hasWriteAccess === undefined) autoCreatePending = true;
           }
           initialShellsReceived = true;
           for (const [id] of message.shells) {
@@ -588,10 +594,10 @@
           const r = computeSnap(
             nx,
             ny,
-            el.offsetWidth / zoom,
-            el.offsetHeight / zoom,
+            el.offsetWidth, // layout px = world px (transform scale is paint-only)
+            el.offsetHeight,
             others,
-            SNAP_PX / zoom,
+            SNAP_PX / zoom, // screen px → world px for the pull threshold
           );
           nx = r.x;
           ny = r.y;
@@ -643,10 +649,12 @@
     // works on mobile (touch) as well as desktop.
     window.addEventListener("pointermove", handleMouse);
     window.addEventListener("pointerup", handleMouseEnd);
+    window.addEventListener("pointercancel", handleMouseEnd);
     document.body.addEventListener("pointerleave", handleMouseEnd);
     return () => {
       window.removeEventListener("pointermove", handleMouse);
       window.removeEventListener("pointerup", handleMouseEnd);
+      window.removeEventListener("pointercancel", handleMouseEnd);
       document.body.removeEventListener("pointerleave", handleMouseEnd);
     };
   });
@@ -763,6 +771,17 @@
   // rejected -> board desync. Require an explicit `true`.
   $: canEdit = hasWriteAccess === true && !lockedForMe;
 
+  // Fire the deferred auto-create once write-perms arrive (still empty board),
+  // or drop it if perms came back read-only / someone else already created one.
+  $: if (autoCreatePending) {
+    if (hasWriteAccess === false || shells.length > 0) {
+      autoCreatePending = false;
+    } else if (canEdit && shells.length === 0) {
+      autoCreatePending = false;
+      handleCreate();
+    }
+  }
+
   // Apply the user's panel/header color (Settings) as a CSS variable that
   // `.panel` reads; empty value falls back to the built-in default.
   $: if (typeof document !== "undefined") {
@@ -783,17 +802,23 @@
     const rects: SnapRect[] = [];
     for (const [id, ws] of shells) {
       const el = termWrappers[id];
-      if (!el) continue;
+      // offsetWidth/Height are layout (world) px — the canvas `transform: scale`
+      // is paint-only and doesn't change them, so NO ÷ zoom here. (Also keeps
+      // this reactive off the zoom dep → no layout reads during pan/zoom.)
+      if (!el || el.offsetWidth <= 0) continue;
       rects.push({
         id: `t${id}`,
         left: ws.x,
         top: ws.y,
-        width: el.offsetWidth / zoom,
-        height: el.offsetHeight / zoom,
+        width: el.offsetWidth,
+        height: el.offsetHeight,
       });
     }
     for (const it of boardItems) {
       if (it.kind === "doc" || it.kind === "lock" || it.kind === "label") continue;
+      // Skip degenerate rects (e.g. videos created with h=0) — a zero-height
+      // rect would place bogus middle/bottom guides.
+      if (!it.w || !it.h) continue;
       rects.push({ id: it.id, left: it.x, top: it.y, width: it.w, height: it.h });
     }
     return rects;
@@ -1192,6 +1217,12 @@
     cameraStream?.getTracks().forEach((t) => t.stop());
     for (const audio of Object.values(remoteAudios)) audio.pause();
     for (const url of Object.values(streamSrcs)) URL.revokeObjectURL(url);
+    // Drop the board-color we painted on the document so SPA nav back to the
+    // landing page doesn't inherit it (falls back to the stylesheet).
+    if (typeof document !== "undefined") {
+      document.documentElement.style.backgroundColor = "";
+      document.body.style.backgroundColor = "";
+    }
   });
 </script>
 

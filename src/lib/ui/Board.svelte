@@ -131,6 +131,11 @@
     longPressActive = false;
     pressTimer = setTimeout(() => {
       if (pressItem && pressEvent) {
+        // Hand off cleanly to the drag listeners — drop the press-phase ones so
+        // a later pointerup doesn't fire both cancelPress and endDrag.
+        window.removeEventListener("pointermove", onPressMove);
+        window.removeEventListener("pointerup", cancelPress);
+        window.removeEventListener("pointercancel", cancelPress);
         longPressActive = true;
         startDrag(pressEvent, pressItem);
       }
@@ -177,6 +182,7 @@
     dragPos = [item.x, item.y];
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", endDrag);
+    window.addEventListener("pointercancel", endDrag);
   }
 
   function onMove(event: PointerEvent) {
@@ -219,6 +225,7 @@
     guidesH = [];
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", endDrag);
+    window.removeEventListener("pointercancel", endDrag);
   }
 
   // Real download. A bare `<a download href={dataUrl}>` silently fails on mobile
@@ -231,7 +238,9 @@
         mime
       ] ?? (item.kind === "video" ? "mp4" : "png");
     try {
-      const blob = await (await fetch(item.dataUrl)).blob();
+      const res = await fetch(item.dataUrl);
+      if (!res.ok) throw new Error(`fetch ${res.status}`);
+      const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -239,7 +248,8 @@
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      // Mobile share/save sheets can be slow — revoke late, not after 2s.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch {
       window.open(item.dataUrl, "_blank");
     }
