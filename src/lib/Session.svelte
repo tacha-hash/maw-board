@@ -1105,13 +1105,28 @@
     }
   }
 
+  // Wait for the DOM to settle before measuring terminal geometry. xterm
+  // recalculates char metrics / rendered size asynchronously relative to Svelte
+  // event handling and browser layout — so a font-size change followed by an
+  // immediate Tile/Fit can read the PREVIOUS offsetWidth/offsetHeight for one
+  // frame and compute a too-tight grid. tick() flushes pending Svelte updates;
+  // two rAFs let the browser finish layout + paint so measurements are current.
+  async function settleLayout() {
+    await tick();
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  }
+
   // Tile all open terminals into a uniform layout and recenter on it.
   // mode: "grid" (auto), "2col", "3col", "rows" (stacked), "cols" (side-by-side),
   // or a number = explicit column count.
-  function tileWindows(mode: string | number = "grid") {
+  async function tileWindows(mode: string | number = "grid") {
     if (!canEdit) return;
     const n = shells.length;
     if (n === 0) return;
+    // Settle layout first so we never measure stale geometry (e.g. right after a
+    // font-size change). Cheap two-frame delay; keeps the real-footprint basis.
+    await settleLayout();
 
     let nCols: number;
     if (typeof mode === "number") nCols = Math.max(1, Math.min(mode, n));
@@ -1207,7 +1222,10 @@
   // (zoom + pan only), so it never moves the shared world positions and never
   // disturbs other devices. This is the responsive "see everything, centered"
   // that makes one shared layout look right on any screen size. (Bo 2026-06-13)
-  function fitToContent() {
+  async function fitToContent() {
+    // Settle layout first (see settleLayout) so the bbox is measured from current
+    // terminal footprints, not stale ones after a font-size change.
+    await settleLayout();
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
