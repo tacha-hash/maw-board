@@ -136,7 +136,7 @@
 
 <style lang="postcss">
   .doc {
-    @apply fixed right-4 top-20 bottom-4 w-[28rem] z-40 flex flex-col p-0 overflow-hidden;
+    @apply fixed left-2 right-2 sm:left-auto sm:right-4 top-20 bottom-4 w-auto sm:w-[28rem] z-40 flex flex-col p-0 overflow-hidden;
   }
   .head {
     @apply flex items-center justify-between px-3 py-2 border-b border-zinc-700/60;

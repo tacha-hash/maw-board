@@ -346,4 +346,15 @@
   .resize-handle.resizing {
     @apply opacity-90;
   }
+
+  /* Touch devices have no hover — keep board-item controls visible + finger-sized. */
+  @media (hover: none), (pointer: coarse) {
+    .delete,
+    .download {
+      @apply opacity-100 p-1.5;
+    }
+    .resize-handle {
+      @apply opacity-90 w-7 h-7;
+    }
+  }
 </style>

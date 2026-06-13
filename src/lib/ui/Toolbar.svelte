@@ -64,8 +64,8 @@
   let brandMenuOpen = false;
 </script>
 
-<div class="panel inline-block px-3 py-2">
-  <div class="flex items-center select-none">
+<div class="panel inline-block px-3 py-2 max-w-[calc(100vw-12px)] overflow-x-auto toolbar-panel">
+  <div class="flex flex-nowrap items-center select-none">
     <div class="brand-wrap">
       <button
         class="brand"
@@ -74,7 +74,7 @@
         title="Oracle Board — system monitor"
       >
         <TerminalIcon size="18" strokeWidth={2} />
-        <span>Oracle Board</span>
+        <span class="hidden sm:inline">Oracle Board</span>
         <ChevronDownIcon size="14" strokeWidth={2} class="chev" />
       </button>
       <OracleBoardMenu open={brandMenuOpen} />
@@ -309,5 +309,17 @@
 
   .activity {
     @apply absolute top-0.5 right-0.5 p-[4px] bg-red-500 rounded-full;
+  }
+
+  .toolbar-panel {
+    touch-action: pan-x;
+    scrollbar-width: thin;
+  }
+
+  /* Touch / coarse pointer: ~44px hit areas without growing the icon glyphs. */
+  @media (hover: none), (pointer: coarse) {
+    .icon-button {
+      @apply min-w-[44px] min-h-[44px] flex items-center justify-center;
+    }
   }
 </style>

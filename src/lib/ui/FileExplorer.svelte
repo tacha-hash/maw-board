@@ -124,7 +124,7 @@
 
 <style lang="postcss">
   .explorer {
-    @apply fixed left-4 top-20 bottom-4 w-72 z-40 flex flex-col p-0 overflow-hidden;
+    @apply fixed left-2 right-2 sm:right-auto sm:left-4 top-20 bottom-4 w-auto sm:w-72 z-40 flex flex-col p-0 overflow-hidden;
   }
   .head {
     @apply flex items-center justify-between px-3 py-2 border-b border-zinc-700/60;

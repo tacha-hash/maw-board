@@ -1124,7 +1124,7 @@
 
 <!-- Wheel handler stops native macOS Chrome zooming on pinch. -->
 <main
-  class="p-8"
+  class="p-2 sm:p-8"
   class:cursor-nwse-resize={resizing !== -1}
   style:background-color={$settings.background}
   on:wheel={(event) => event.preventDefault()}
@@ -1172,7 +1172,7 @@
     />
 
     {#if showNetworkInfo}
-      <div class="absolute top-20 translate-x-[116.5px]">
+      <div class="absolute top-20 left-2 right-2 sm:left-auto sm:right-auto translate-x-0 sm:translate-x-[116.5px] max-w-[calc(100vw-1rem)] sm:max-w-none">
         <NetworkInfo
           status={connected
             ? "connected"
@@ -1227,7 +1227,7 @@
 
   {#if showChat}
     <div
-      class="absolute flex flex-col justify-end inset-y-4 right-4 w-80 pointer-events-none z-10"
+      class="absolute flex flex-col justify-end inset-y-4 left-2 right-2 sm:left-auto sm:right-4 w-auto sm:w-80 pointer-events-none z-10"
     >
       <Chat
         {userId}

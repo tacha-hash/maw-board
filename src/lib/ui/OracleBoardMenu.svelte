@@ -127,7 +127,7 @@
 
 <style lang="postcss">
   .board-menu {
-    @apply absolute left-0 top-full mt-2 z-40 w-60 p-3 rounded-xl;
+    @apply absolute left-0 top-full mt-2 z-40 w-60 max-w-[calc(100vw-1rem)] p-3 rounded-xl;
     @apply bg-zinc-900/95 ring-1 ring-zinc-700 shadow-2xl backdrop-blur-sm;
     @apply font-mono text-xs text-zinc-300 select-none;
   }
