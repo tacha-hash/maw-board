@@ -36,6 +36,10 @@ struct Args {
     /// Hostname of this server, if running multiple servers.
     #[clap(long)]
     host: Option<String>,
+
+    /// Password that gates private board routes.
+    #[clap(long, env = "SSHX_BOARD_PASSWORD")]
+    board_password: Option<String>,
 }
 
 #[tokio::main]
@@ -50,6 +54,7 @@ async fn start(args: Args) -> Result<()> {
     options.override_origin = args.override_origin;
     options.redis_url = args.redis_url;
     options.host = args.host;
+    options.board_password = args.board_password;
 
     let server = Server::new(options)?;
 

@@ -13,7 +13,7 @@ use sshx_core::{Sid, Uid};
 use sshx_server::{
     state::ServerState,
     web::protocol::{WsClient, WsServer, WsUser, WsWinsize},
-    Server,
+    Server, ServerOptions,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time;
@@ -32,10 +32,15 @@ impl TestServer {
     /// Returns an object with the local address, as well as a custom [`Drop`]
     /// implementation that gracefully shuts down the server.
     pub async fn new() -> Self {
+        Self::new_with_options(Default::default()).await
+    }
+
+    /// Create a fresh test server with explicit server options.
+    pub async fn new_with_options(options: ServerOptions) -> Self {
         let listener = TcpListener::bind("[::1]:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let server = Arc::new(Server::new(Default::default()).unwrap());
+        let server = Arc::new(Server::new(options).unwrap());
         {
             let server = Arc::clone(&server);
             let listener = listener.tap_io(|tcp_stream| {

@@ -34,6 +34,9 @@ pub struct ServerState {
     /// Override the origin returned for the Open() RPC.
     override_origin: Option<String>,
 
+    /// Password that gates private board routes, if configured.
+    board_password: Option<String>,
+
     /// A concurrent map of session IDs to session objects.
     store: DashMap<String, Arc<Session>>,
 
@@ -52,6 +55,7 @@ impl ServerState {
         Ok(Self {
             mac: Hmac::new_from_slice(secret.as_bytes()).unwrap(),
             override_origin: options.override_origin,
+            board_password: options.board_password.filter(|p| !p.is_empty()),
             store: DashMap::new(),
             mesh,
         })
@@ -65,6 +69,11 @@ impl ServerState {
     /// Returns the override origin for the Open() RPC.
     pub fn override_origin(&self) -> Option<String> {
         self.override_origin.clone()
+    }
+
+    /// Returns the configured private board password, if enabled.
+    pub fn board_password(&self) -> Option<&str> {
+        self.board_password.as_deref()
     }
 
     /// Lookup a local session by name.
