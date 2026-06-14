@@ -407,15 +407,25 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+/// Default file browser root (VPS deployments). Overridable at runtime via the
+/// `MAW_FILES_ROOT` env var for hosts without `/root` (e.g. macOS).
+const FILES_ROOT_DEFAULT: &str = "/root/maw-workspace";
+
 /// Read-only file browser root. Listing is confined to this directory; any
 /// attempt to escape it (via `..` or absolute components) is rejected.
-const FILES_ROOT: &str = "/root/maw-workspace";
+/// Reads `MAW_FILES_ROOT` at call time, falling back to the VPS default so
+/// existing deployments are unaffected.
+fn files_root() -> PathBuf {
+    std::env::var_os("MAW_FILES_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(FILES_ROOT_DEFAULT))
+}
 
 /// Resolve a caller-supplied relative path against FILES_ROOT, rejecting any
 /// component that could escape the root. Returns None if the path is unsafe.
 fn safe_join(rel: &str) -> Option<PathBuf> {
-    let root = Path::new(FILES_ROOT);
-    let mut out = root.to_path_buf();
+    let root = files_root();
+    let mut out = root.clone();
     for comp in Path::new(rel).components() {
         match comp {
             Component::Normal(c) => out.push(c),
@@ -424,7 +434,7 @@ fn safe_join(rel: &str) -> Option<PathBuf> {
             _ => return None,
         }
     }
-    if out.starts_with(root) {
+    if out.starts_with(&root) {
         Some(out)
     } else {
         None
@@ -440,7 +450,7 @@ fn safe_join(rel: &str) -> Option<PathBuf> {
 /// None on escape OR if the path does not exist (callers map None -> 404, which
 /// also avoids leaking which case occurred).
 async fn confine_to_root(path: &Path) -> Option<PathBuf> {
-    let canon_root = tokio::fs::canonicalize(FILES_ROOT).await.ok()?;
+    let canon_root = tokio::fs::canonicalize(files_root()).await.ok()?;
     let canon = tokio::fs::canonicalize(path).await.ok()?;
     canon.starts_with(&canon_root).then_some(canon)
 }
