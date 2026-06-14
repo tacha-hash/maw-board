@@ -67,8 +67,8 @@ pub fn app() -> Router<Arc<ServerState>> {
         )
 }
 
-async fn go_redirect() -> Response {
-    match tokio::fs::read_to_string("/root/.sshx-oracle-url.txt").await {
+async fn go_redirect(State(state): State<Arc<ServerState>>) -> Response {
+    match tokio::fs::read_to_string(state.oracle_url_file()).await {
         Ok(contents) => {
             let url = contents.trim();
             if url.is_empty() {

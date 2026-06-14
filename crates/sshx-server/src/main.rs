@@ -40,6 +40,10 @@ struct Args {
     /// Password that gates private board routes.
     #[clap(long, env = "SSHX_BOARD_PASSWORD")]
     board_password: Option<String>,
+
+    /// Path to the file containing the active oracle session URL.
+    #[clap(long, env = "SSHX_ORACLE_URL_FILE")]
+    oracle_url_file: Option<String>,
 }
 
 #[tokio::main]
@@ -55,6 +59,7 @@ async fn start(args: Args) -> Result<()> {
     options.redis_url = args.redis_url;
     options.host = args.host;
     options.board_password = args.board_password;
+    options.oracle_url_file = args.oracle_url_file;
 
     let server = Server::new(options)?;
 
