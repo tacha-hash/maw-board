@@ -34,9 +34,11 @@
     detectEdgeSnapAction,
     applySnapGap,
     isSnapAction,
+    snapShortcutAction,
     snapSharedEdges,
     type SnapRect,
     type SnapAction,
+    type SnapShortcutAction,
     type ViewRect,
   } from "./snap";
   import Board from "./ui/Board.svelte";
@@ -201,6 +203,7 @@
   let pendingEdgeSnap: { id: number; action: SnapAction } | null = null;
   let snapRestore: Record<number, WsWinsize> = {};
   let snapHistory: Record<number, { action: SnapAction; rect: ViewRect }> = {};
+  let snapPadFor: number | null = null;
   let layoutModeId: number | null = null;
   let layoutModeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -826,6 +829,34 @@
     };
   });
 
+  onMount(() => {
+    function handleGlobalSnapShortcut(event: KeyboardEvent) {
+      if (event.key === "Escape" && snapPadFor !== null) {
+        snapPadFor = null;
+        return;
+      }
+
+      const action = snapShortcutAction(event);
+      if (action === null) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const id = shortcutTargetId();
+      if (id === null) {
+        makeToast({ kind: "info", message: "Tap a terminal first." });
+        return;
+      }
+
+      snapPadFor = null;
+      handleShortcutSnap(id, action);
+    }
+
+    window.addEventListener("keydown", handleGlobalSnapShortcut, true);
+    return () =>
+      window.removeEventListener("keydown", handleGlobalSnapShortcut, true);
+  });
+
   let focused: number[] = [];
   let lastFocused = -1; // most-recent focused shell; survives blur for snippet paste
   $: setFocus(focused);
@@ -1377,6 +1408,18 @@
     if (shells.some(([sid]) => sid === live)) return live;
     if (shells.some(([sid]) => sid === lastFocused)) return lastFocused;
     return shells[0]?.[0] ?? null;
+  }
+
+  function shortcutTargetId() {
+    const live = focused[0];
+    if (shells.some(([sid]) => sid === live)) return live;
+    if (shells.some(([sid]) => sid === lastFocused)) return lastFocused;
+    return null;
+  }
+
+  function handleShortcutSnap(id: number, action: SnapShortcutAction) {
+    if (action === "restore") restoreSnap(id);
+    else void applySnap(id, action);
   }
 
   function cycleSnapAction(id: number, requested: SnapAction, current: ViewRect) {
@@ -2121,6 +2164,7 @@
           bind:termEl={termElements[id]}
           label={labels[id] ?? ""}
           canRename={canEdit}
+          snapPadOpen={canEdit && snapPadFor === id}
           on:rename={({ detail }) => handleRename(id, detail)}
           on:data={({ detail: data }) => routeInput(id, data)}
           on:close={() => canEdit && srocket?.send({ close: id })}
@@ -2145,6 +2189,12 @@
             srocket?.send({ move: [id, { ...ws, rows: r, cols: c }] });
           }}
           on:snap={({ detail }) => handleSnapButton(id, detail)}
+          on:showSnapPad={() => {
+            if (canEdit) snapPadFor = id;
+          }}
+          on:hideSnapPad={() => {
+            if (snapPadFor === id) snapPadFor = null;
+          }}
           on:bringToFront={() => {
             if (!canEdit) return;
             showNetworkInfo = false;
@@ -2155,9 +2205,11 @@
             if (hasWriteAccess === false) return;
             focused = [...focused, id];
             lastFocused = id; // remember for snippet paste after panel clicks
+            if (canEdit) snapPadFor = id;
           }}
           on:blur={() => {
             focused = focused.filter((i) => i !== id);
+            if (snapPadFor === id) snapPadFor = null;
           }}
         />
 

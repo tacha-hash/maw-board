@@ -13,6 +13,7 @@ try {
     computeSnapTarget,
     detectEdgeSnapAction,
     isSnapAction,
+    snapShortcutAction,
     snapSharedEdges,
   } = await server.ssrLoadModule("/src/lib/snap.ts");
 
@@ -102,6 +103,35 @@ try {
 
   assert.equal(isSnapAction("lastTwoThirds"), true);
   assert.equal(isSnapAction("restore"), false);
+  assert.equal(
+    snapShortcutAction({ key: "ArrowRight", ctrlKey: true, altKey: true }),
+    "rightHalf",
+  );
+  assert.equal(
+    snapShortcutAction({ key: "u", ctrlKey: true, altKey: true }),
+    "topLeft",
+  );
+  assert.equal(
+    snapShortcutAction({ key: "0", ctrlKey: true, altKey: true }),
+    "restore",
+  );
+  assert.equal(
+    snapShortcutAction({ key: "ArrowRight", ctrlKey: false, altKey: true }),
+    null,
+  );
+  assert.equal(
+    snapShortcutAction({
+      key: "ArrowRight",
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: true,
+    }),
+    null,
+  );
+  assert.equal(
+    snapShortcutAction({ key: "x", ctrlKey: true, altKey: true }),
+    null,
+  );
   assert.deepEqual(snapSharedEdges("centerThird", landscape), [
     "left",
     "right",

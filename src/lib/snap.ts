@@ -151,6 +151,30 @@ export interface EdgeSnapOptions {
 }
 
 export type SnapEdge = "left" | "right" | "top" | "bottom";
+export type SnapShortcutAction = SnapAction | "restore";
+
+export interface SnapShortcutModifiers {
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  meta: boolean;
+}
+
+export interface SnapShortcutKeyState {
+  key: string;
+  ctrlKey: boolean;
+  altKey: boolean;
+  shiftKey?: boolean;
+  metaKey?: boolean;
+}
+
+// One place to change if Bo's OS grabs Ctrl+Alt+Arrow before the browser sees it.
+export const DEFAULT_SNAP_SHORTCUT_MODIFIERS: SnapShortcutModifiers = {
+  ctrl: true,
+  alt: true,
+  shift: false,
+  meta: false,
+};
 
 export function isSnapAction(action: string): action is SnapAction {
   switch (action) {
@@ -175,6 +199,65 @@ export function isSnapAction(action: string): action is SnapAction {
       return true;
     default:
       return false;
+  }
+}
+
+function hasSnapShortcutModifiers(
+  event: SnapShortcutKeyState,
+  modifiers: SnapShortcutModifiers,
+) {
+  return (
+    event.ctrlKey === modifiers.ctrl &&
+    event.altKey === modifiers.alt &&
+    !!event.shiftKey === modifiers.shift &&
+    !!event.metaKey === modifiers.meta
+  );
+}
+
+export function snapShortcutAction(
+  event: SnapShortcutKeyState,
+  modifiers = DEFAULT_SNAP_SHORTCUT_MODIFIERS,
+): SnapShortcutAction | null {
+  if (!hasSnapShortcutModifiers(event, modifiers)) return null;
+
+  switch (event.key) {
+    case "ArrowLeft":
+      return "leftHalf";
+    case "ArrowRight":
+      return "rightHalf";
+    case "ArrowUp":
+      return "topHalf";
+    case "ArrowDown":
+      return "bottomHalf";
+    case "u":
+    case "U":
+      return "topLeft";
+    case "i":
+    case "I":
+      return "topRight";
+    case "j":
+    case "J":
+      return "bottomLeft";
+    case "k":
+    case "K":
+      return "bottomRight";
+    case "f":
+    case "F":
+      return "maximize";
+    case "c":
+    case "C":
+      return "center";
+    case "1":
+      return "firstThird";
+    case "2":
+      return "centerThird";
+    case "3":
+      return "lastThird";
+    case "0":
+    case "Backspace":
+      return "restore";
+    default:
+      return null;
   }
 }
 
