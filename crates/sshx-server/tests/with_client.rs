@@ -542,3 +542,25 @@ async fn test_board_password_gate() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_healthz() -> Result<()> {
+    let mut options = ServerOptions::default();
+    options.board_password = Some("test board password".to_string());
+    let server = TestServer::new_with_options(options).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", server.local_addr());
+
+    let resp = client.get(format!("{base}/api/healthz")).send().await?;
+    assert_eq!(resp.status(), http::StatusCode::OK);
+    assert_eq!(resp.text().await?, "OK");
+
+    let resp = client
+        .get(format!("{base}/api/healthz"))
+        .header(http::header::HOST, "external.domain.com")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
+    Ok(())
+}

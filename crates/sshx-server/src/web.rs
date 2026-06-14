@@ -111,6 +111,30 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/sysstat", get(sysstat))
         .route("/files", get(list_files))
         .route("/file", get(read_file))
+        .route("/healthz", get(healthz))
+}
+
+async fn healthz(req: Request<Body>) -> Response {
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    let is_local = host.starts_with("localhost")
+        || host.starts_with("127.0.0.1")
+        || host.starts_with("[::1]")
+        || req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|axum::extract::ConnectInfo(addr)| addr.ip().is_loopback())
+            .unwrap_or(false);
+
+    if is_local {
+        (StatusCode::OK, "OK").into_response()
+    } else {
+        (StatusCode::FORBIDDEN, "local-only endpoint").into_response()
+    }
 }
 
 const BOARD_AUTH_COOKIE: &str = "sshx_board_auth";
