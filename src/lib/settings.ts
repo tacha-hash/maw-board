@@ -38,7 +38,7 @@ export const settings: Readable<Settings> = derived(
 
     let fontSize = $storedSettings.fontSize;
     if (typeof fontSize !== "number" || fontSize < 8 || fontSize > 40) {
-      fontSize = 14;
+      fontSize = 21;
     }
 
     const background =
