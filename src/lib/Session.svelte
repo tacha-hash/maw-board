@@ -971,18 +971,23 @@
   }
 
   // Add an image to the board (file picker, paste, or drag-and-drop).
+  // Local preview uses the original blob (sharp); peers get the encoded share.
   function addImage(file: File) {
     if (!canEdit) return;
-    readImageFile(file, (dataUrl, w, h) => {
+    const id = crypto.randomUUID();
+    const localUrl = URL.createObjectURL(file);
+    streamSrcs = { ...streamSrcs, [id]: localUrl };
+
+    readImageFile(file, (payload) => {
       const [x, y] = nextBoardPos();
       const item: BoardItem = {
-        id: crypto.randomUUID(),
+        id,
         kind: "image",
         x,
         y,
-        w,
-        h,
-        dataUrl,
+        w: payload.tileW,
+        h: payload.tileH,
+        dataUrl: payload.dataUrl,
       };
       upsertBoardItem(item);
       srocket?.send({ boardPut: item });

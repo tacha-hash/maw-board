@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy } from "svelte";
   import { fade } from "svelte/transition";
-  import { XIcon, DownloadIcon } from "svelte-feather-icons";
+  import { XIcon, DownloadIcon, Maximize2Icon } from "svelte-feather-icons";
 
   import { slide } from "../action/slide";
   import { computeSnap, type SnapRect } from "../snap";
@@ -42,6 +42,27 @@
     delete: string;
     edit: { id: string; text: string };
   }>();
+
+  let lightboxSrc: string | null = null;
+
+  function openLightbox(item: BoardItem) {
+    lightboxSrc = streamSrcs[item.id] ?? item.dataUrl;
+  }
+
+  function closeLightbox() {
+    lightboxSrc = null;
+  }
+
+  function downloadLightbox() {
+    if (!lightboxSrc) return;
+    const a = document.createElement("a");
+    a.href = lightboxSrc;
+    a.download = `maw-rs-image-${Date.now()}.jpg`;
+    a.target = "_blank";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
 
   // Resize state — drag the bottom-right handle to stretch a tile (like a window).
   const MIN_W = 120;
@@ -259,12 +280,13 @@
   // re-fetch into a Blob, hand out an object URL with a proper filename + ext,
   // and fall back to opening the raw URL (long-press-to-save) if that throws.
   async function downloadItem(item: BoardItem) {
+    const src = streamSrcs[item.id] ?? item.dataUrl;
     const ext = (mime: string) =>
       ({ "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif", "video/mp4": "mp4", "video/webm": "webm" })[
         mime
       ] ?? (item.kind === "video" ? "mp4" : "png");
     try {
-      const res = await fetch(item.dataUrl);
+      const res = await fetch(src);
       if (!res.ok) throw new Error(`fetch ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -341,11 +363,25 @@
           src={streamSrcs[item.id] ?? item.dataUrl}
           alt={item.kind === "stream" ? "screen share" : "shared image"}
           draggable="false"
+          class:zoomable={item.kind === "image"}
+          on:dblclick|stopPropagation={() =>
+            item.kind === "image" && openLightbox(item)}
         />
       {/if}
 
       {#if item.kind === "stream"}
         <div class="live-tag">● LIVE</div>
+      {/if}
+
+      {#if item.kind === "image"}
+        <button
+          class="expand"
+          title="Expand image"
+          on:pointerdown={(event) => event.stopPropagation()}
+          on:click={() => openLightbox(item)}
+        >
+          <Maximize2Icon size="14" />
+        </button>
       {/if}
 
       {#if item.kind === "video" || item.kind === "image"}
@@ -415,6 +451,22 @@
   </div>
 {/each}
 
+{#if lightboxSrc}
+  <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+  <div class="lightbox" on:click={closeLightbox} role="presentation">
+    <div class="lightbox-toolbar">
+      <button class="lightbox-btn" title="Download" on:click|stopPropagation={downloadLightbox}>
+        <DownloadIcon size="18" />
+      </button>
+      <button class="lightbox-btn" title="Close" on:click|stopPropagation={closeLightbox}>
+        <XIcon size="18" />
+      </button>
+    </div>
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <img class="lightbox-img" src={lightboxSrc} alt="expanded image" on:click|stopPropagation />
+  </div>
+{/if}
+
 <style lang="postcss">
   .board-item {
     @apply relative rounded-lg overflow-hidden bg-zinc-900 shadow-lg cursor-move select-none;
@@ -459,7 +511,12 @@
   }
 
   .board-item img {
-    @apply block w-full h-auto pointer-events-none;
+    @apply block w-full h-auto;
+  }
+
+  .board-item img.zoomable {
+    @apply cursor-zoom-in;
+    image-rendering: auto;
   }
 
   .board-item video {
@@ -480,9 +537,14 @@
     @apply opacity-100;
   }
 
+  .expand {
+    @apply absolute bottom-1 right-1 p-1 rounded bg-zinc-900/90 text-zinc-100 z-30;
+    @apply opacity-90 transition-opacity hover:bg-indigo-600 hover:text-white;
+  }
+
   .download {
-    @apply absolute bottom-1 left-1 p-0.5 rounded bg-zinc-800/80 text-zinc-300 z-30;
-    @apply opacity-0 transition-opacity hover:bg-indigo-600 hover:text-white;
+    @apply absolute bottom-1 left-1 p-1 rounded bg-zinc-900/90 text-zinc-100 z-30;
+    @apply opacity-90 transition-opacity hover:bg-indigo-600 hover:text-white;
   }
 
   .drag-grip {
@@ -495,8 +557,26 @@
     @apply opacity-100;
   }
 
-  .board-item:hover .download {
+  .board-item:hover .download,
+  .board-item:hover .expand {
     @apply opacity-100;
+  }
+
+  .lightbox {
+    @apply fixed inset-0 z-[200] flex items-center justify-center bg-black/90 p-4;
+  }
+
+  .lightbox-img {
+    @apply max-w-[min(96vw,1920px)] max-h-[90vh] w-auto h-auto object-contain rounded-lg shadow-2xl;
+    image-rendering: auto;
+  }
+
+  .lightbox-toolbar {
+    @apply absolute top-4 right-4 flex gap-2 z-[210];
+  }
+
+  .lightbox-btn {
+    @apply p-2 rounded-lg bg-zinc-800/90 text-zinc-100 hover:bg-indigo-600;
   }
 
   .resize-handle {

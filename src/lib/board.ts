@@ -139,13 +139,69 @@ export async function startScreenShare(
   return { stop };
 }
 
+/** Max width encoded for peers over WS (was 720 — too blurry on phone). */
+export const IMAGE_SHARE_MAX_WIDTH = 1920;
+/** Default tile width on the board canvas. */
+export const IMAGE_TILE_MAX_WIDTH = 960;
+export const IMAGE_JPEG_QUALITY = 0.92;
+/** Skip broadcasting huge data URLs (mirrors video share cap pattern). */
+export const IMAGE_SHARE_CAP_BYTES = 3 * 1024 * 1024;
+
+export type ImagePayload = {
+  /** Encoded data URL for peers (JPEG/PNG). */
+  dataUrl: string;
+  /** Natural encoded dimensions. */
+  w: number;
+  h: number;
+  /** Suggested tile width/height on the board. */
+  tileW: number;
+  tileH: number;
+};
+
+function encodeCanvas(
+  canvas: HTMLCanvasElement,
+  mime: string,
+  quality: number,
+): string {
+  if (mime === "image/png") return canvas.toDataURL("image/png");
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+function estimateDataUrlBytes(dataUrl: string): number {
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return dataUrl.length;
+  const b64 = dataUrl.slice(comma + 1);
+  return Math.ceil((b64.length * 3) / 4);
+}
+
+function drawScaled(
+  img: HTMLImageElement,
+  maxWidth: number,
+  mime: string,
+  quality: number,
+): ImagePayload {
+  const scale = Math.min(1, maxWidth / img.width);
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext("2d")?.drawImage(img, 0, 0, w, h);
+  const dataUrl = encodeCanvas(canvas, mime, quality);
+  const tileScale = Math.min(1, IMAGE_TILE_MAX_WIDTH / w);
+  const tileW = Math.max(120, Math.round(w * tileScale));
+  const tileH = Math.max(80, Math.round(h * tileScale));
+  return { dataUrl, w, h, tileW, tileH };
+}
+
 /**
- * Read an image file, downscale it (max 720px wide, JPEG q0.82), and deliver
- * the resulting data URL and dimensions for a `{ kind: "image" }` board item.
+ * Read an image file for the maw rs / workboard viewer (ported from ssh-share
+ * viewer.js). Produces a sharper share encode (up to 1920px, q0.92) plus tile
+ * dimensions for the board item.
  */
 export function readImageFile(
   file: File,
-  onImage: (dataUrl: string, w: number, h: number) => void,
+  onImage: (payload: ImagePayload) => void,
 ) {
   if (!file || !file.type.startsWith("image/")) return;
   const reader = new FileReader();
@@ -153,16 +209,33 @@ export function readImageFile(
     const src = reader.result as string;
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, 720 / img.width);
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      canvas.getContext("2d")?.drawImage(img, 0, 0, w, h);
-      onImage(canvas.toDataURL("image/jpeg", 0.82), w, h);
+      const preferPng = file.type === "image/png";
+      let payload = drawScaled(
+        img,
+        IMAGE_SHARE_MAX_WIDTH,
+        preferPng ? "image/png" : "image/jpeg",
+        IMAGE_JPEG_QUALITY,
+      );
+      // If still too large for WS, step down width until it fits or hit floor.
+      let maxW = IMAGE_SHARE_MAX_WIDTH;
+      while (
+        estimateDataUrlBytes(payload.dataUrl) > IMAGE_SHARE_CAP_BYTES &&
+        maxW > 480
+      ) {
+        maxW = Math.round(maxW * 0.75);
+        payload = drawScaled(img, maxW, "image/jpeg", IMAGE_JPEG_QUALITY);
+      }
+      onImage(payload);
     };
-    img.onerror = () => onImage(src, 320, 240);
+    img.onerror = () => {
+      onImage({
+        dataUrl: src,
+        w: 320,
+        h: 240,
+        tileW: 320,
+        tileH: 240,
+      });
+    };
     img.src = src;
   };
   reader.readAsDataURL(file);
