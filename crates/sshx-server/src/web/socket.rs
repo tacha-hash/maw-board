@@ -266,7 +266,9 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
-                session.board_put(item);
+                if let Err(e) = session.board_put(item) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                }
             }
             WsClient::BoardMove(id, x, y) => {
                 if let Err(e) = session.check_write_permission(user_id) {

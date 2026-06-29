@@ -121,9 +121,13 @@ impl Session {
         drop(shells);
         session.source.send_replace(winsizes);
         {
+            use std::collections::HashMap;
+            use tracing::warn;
+
             let mut board = session.board.lock();
+            let mut by_id: HashMap<String, BoardItem> = HashMap::new();
             for item in message.board_items {
-                board.push(BoardItem {
+                let board_item = BoardItem {
                     id: item.id,
                     kind: item.kind,
                     x: item.x,
@@ -131,7 +135,17 @@ impl Session {
                     w: item.w,
                     h: item.h,
                     data_url: item.data_url,
-                });
+                };
+                if let Err(e) = super::validate_board_item(&board_item) {
+                    warn!(id = %board_item.id, "skipping invalid board item on restore: {e}");
+                    continue;
+                }
+                by_id.insert(board_item.id.clone(), board_item);
+            }
+            board.extend(by_id.into_values());
+            if board.len() > super::MAX_BOARD_ITEMS {
+                board.truncate(super::MAX_BOARD_ITEMS);
+                warn!("truncated board items to max {}", super::MAX_BOARD_ITEMS);
             }
         }
         session
@@ -170,7 +184,7 @@ mod tests {
             h: 80,
             data_url: "data:image/png;base64,abc".to_owned(),
         };
-        session.board_put(item.clone());
+        session.board_put(item.clone())?;
         let data = session.snapshot()?;
         let restored = Session::restore(&data)?;
         assert_eq!(restored.board_snapshot(), vec![item]);

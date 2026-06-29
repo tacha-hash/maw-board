@@ -25,6 +25,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::ServerState;
 
 pub mod protocol;
+mod pages;
 mod socket;
 
 /// Returns the web application server, routed with Axum.
@@ -79,21 +80,7 @@ async fn go_redirect(State(state): State<Arc<ServerState>>) -> Response {
                 // Wrap the live session in a full-page iframe so the browser
                 // address bar stays at `/go` (the session id + encryption key
                 // stay hidden inside the frame instead of redirecting the bar).
-                let safe = url.replace('"', "%22");
-                let html = format!(
-                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
-<meta name=\"theme-color\" content=\"#0e0e10\">\
-<meta name=\"mobile-web-app-capable\" content=\"yes\">\
-<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\
-<title>Oracle Terminal</title>\
-<style>html,body{{margin:0;padding:0;width:100%;height:100vh;height:100dvh;\
-background:#000;overflow:hidden}}\
-iframe{{border:0;width:100%;height:100%;display:block}}</style></head>\
-<body><iframe src=\"{safe}\" \
-allow=\"microphone; camera; display-capture; clipboard-read; clipboard-write; fullscreen\">\
-</iframe></body></html>"
-                );
+                let html = pages::go_iframe_page(url);
                 (
                     [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
                     html,
@@ -246,34 +233,7 @@ fn redirect_response(location: &str, cookie: Option<&str>) -> Response {
 }
 
 fn login_form_response(next: &str, failed: bool) -> Response {
-    let escaped_next = escape_html_attr(next);
-    let message = if failed {
-        "<p class=\"error\">Wrong password.</p>"
-    } else {
-        ""
-    };
-    let html = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
-<meta name=\"theme-color\" content=\"#0e0e10\">\
-<title>Oracle Board Login</title>\
-<style>html,body{{margin:0;min-height:100%;background:#0e0e10;color:#f5f5f5;\
-font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}\
-body{{display:grid;place-items:center;padding:24px}}main{{width:min(360px,100%)}}\
-h1{{font-size:20px;font-weight:650;margin:0 0 16px}}\
-form{{display:grid;gap:12px}}input,button{{font:inherit;border-radius:10px}}\
-input{{height:44px;border:1px solid #3b3b40;background:#18181b;color:#fff;padding:0 12px}}\
-button{{height:46px;border:0;background:#f59e0b;color:#1f1300;font-weight:700}}\
-.error{{color:#fca5a5;margin:0 0 12px}}</style></head>\
-<body><main><h1>Oracle Board</h1>{message}\
-<form method=\"post\" action=\"/login\">\
-<input type=\"hidden\" name=\"next\" value=\"{escaped_next}\">\
-<input name=\"password\" type=\"password\" autocomplete=\"current-password\" autofocus required>\
-<button type=\"submit\">Unlock</button></form></main>\
-<script>const n=document.querySelector('input[name=next]');\
-if(n&&location.hash&&n.value&&!n.value.includes('#'))n.value+=location.hash;</script>\
-</body></html>"
-    );
+    let html = pages::login_form_page(next, failed);
     let status = if failed {
         StatusCode::UNAUTHORIZED
     } else {
@@ -383,7 +343,7 @@ fn percent_encode_query(value: &str) -> String {
     out
 }
 
-fn escape_html_attr(value: &str) -> String {
+pub(crate) fn escape_html_attr(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {

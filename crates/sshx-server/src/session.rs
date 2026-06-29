@@ -25,6 +25,41 @@ mod snapshot;
 /// Store a rolling buffer with at most this quantity of output, per shell.
 const SHELL_STORED_BYTES: u64 = 1 << 21; // 2 MiB
 
+/// Maximum collaborative board items per session.
+pub(crate) const MAX_BOARD_ITEMS: usize = 128;
+/// Maximum bytes per board item `data_url`.
+const MAX_BOARD_DATA_URL_BYTES: usize = 2 << 20; // 2 MiB
+const MAX_BOARD_ID_LEN: usize = 256;
+const MAX_BOARD_KIND_LEN: usize = 64;
+const MIN_BOARD_DIM: u32 = 1;
+const MAX_BOARD_DIM: u32 = 16_384;
+
+pub(crate) fn validate_board_item(item: &BoardItem) -> Result<()> {
+    use anyhow::ensure;
+    ensure!(!item.id.is_empty(), "board item id empty");
+    ensure!(
+        item.id.len() <= MAX_BOARD_ID_LEN,
+        "board item id too long (max {MAX_BOARD_ID_LEN})"
+    );
+    ensure!(
+        item.kind.len() <= MAX_BOARD_KIND_LEN,
+        "board item kind too long (max {MAX_BOARD_KIND_LEN})"
+    );
+    ensure!(
+        item.w >= MIN_BOARD_DIM && item.h >= MIN_BOARD_DIM,
+        "board item dimensions too small (min {MIN_BOARD_DIM})"
+    );
+    ensure!(
+        item.w <= MAX_BOARD_DIM && item.h <= MAX_BOARD_DIM,
+        "board item dimensions too large (max {MAX_BOARD_DIM})"
+    );
+    ensure!(
+        item.data_url.len() <= MAX_BOARD_DATA_URL_BYTES,
+        "board item data_url too large (max {MAX_BOARD_DATA_URL_BYTES} bytes)"
+    );
+    Ok(())
+}
+
 /// Static metadata for this session.
 #[derive(Debug, Clone)]
 pub struct Metadata {
@@ -378,16 +413,21 @@ impl Session {
     }
 
     /// Add or update a board item, broadcasting to all clients.
-    pub fn board_put(&self, item: BoardItem) {
+    pub fn board_put(&self, item: BoardItem) -> Result<()> {
+        validate_board_item(&item)?;
         {
             let mut board = self.board.lock();
             if let Some(existing) = board.iter_mut().find(|b| b.id == item.id) {
                 *existing = item.clone();
             } else {
+                if board.len() >= MAX_BOARD_ITEMS {
+                    bail!("board item limit reached (max {MAX_BOARD_ITEMS})");
+                }
                 board.push(item.clone());
             }
         }
         self.broadcast.send(WsServer::BoardPut(item)).ok();
+        Ok(())
     }
 
     /// Move a board item to a new position, broadcasting to all clients.
