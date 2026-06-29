@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{ensure, Context, Result};
 use prost::Message;
 use sshx_core::{
-    proto::{SerializedSession, SerializedShell},
+    proto::{SerializedBoardItem, SerializedSession, SerializedShell},
     Sid, Uid,
 };
 
