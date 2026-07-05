@@ -31,6 +31,28 @@ struct Args {
     /// editors.
     #[clap(long)]
     enable_readers: bool,
+
+    /// Join an existing session (by name) as an additional backend, instead
+    /// of creating a new one. Requires --join-token and --encryption-key
+    /// (get both from the primary backend's own output).
+    #[clap(long, requires_all = ["join_token", "encryption_key"])]
+    join: Option<String>,
+
+    /// Join-authorization token for --join, printed by the primary backend.
+    #[clap(long)]
+    join_token: Option<String>,
+
+    /// Encryption key to join with — MUST match the session's own key
+    /// (copy it from the primary's write/read URL fragment, the part after
+    /// '#'). A mismatched key is rejected by the server rather than
+    /// producing undecryptable garbage.
+    #[clap(long)]
+    encryption_key: Option<String>,
+
+    /// Human-readable label for this backend when joining (defaults to
+    /// user@hostname, same as --name).
+    #[clap(long)]
+    backend_name: Option<String>,
 }
 
 fn print_greeting(shell: &str, controller: &Controller) {
@@ -69,6 +91,16 @@ fn print_greeting(shell: &str, controller: &Controller) {
             shell_v = Fixed(8).paint(shell),
         );
     }
+    if let Some(join_token) = controller.join_token() {
+        println!(
+            "  {arr}  To join from another node:\n      sshx --server {server} --join {name} \\\n        --join-token {token} --encryption-key {key}\n",
+            arr = Green.paint("➜"),
+            server = controller.origin(),
+            name = controller.name(),
+            token = join_token,
+            key = controller.encryption_key(),
+        );
+    }
 }
 
 #[tokio::main]
@@ -78,7 +110,7 @@ async fn start(args: Args) -> Result<()> {
         None => get_default_shell().await,
     };
 
-    let name = args.name.unwrap_or_else(|| {
+    let name = args.name.clone().unwrap_or_else(|| {
         let mut name = whoami::username();
         if let Ok(host) = whoami::fallible::hostname() {
             // Trim domain information like .lan or .local
@@ -90,7 +122,21 @@ async fn start(args: Args) -> Result<()> {
     });
 
     let runner = Runner::Shell(shell.clone());
-    let mut controller = Controller::new(&args.server, &name, runner, args.enable_readers).await?;
+    let mut controller = match args.join {
+        Some(join_name) => {
+            let backend_name = args.backend_name.unwrap_or_else(|| name.clone());
+            Controller::join(
+                &args.server,
+                &join_name,
+                args.join_token.as_deref().expect("clap requires_all"),
+                args.encryption_key.as_deref().expect("clap requires_all"),
+                &backend_name,
+                runner,
+            )
+            .await?
+        }
+        None => Controller::new(&args.server, &name, runner, args.enable_readers).await?,
+    };
     if args.quiet {
         if let Some(write_url) = controller.write_url() {
             println!("{}", write_url);

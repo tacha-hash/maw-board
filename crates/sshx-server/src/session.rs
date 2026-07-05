@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -9,7 +10,7 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use sshx_core::{
     proto::{server_update::ServerMessage, SequenceNumbers},
-    IdCounter, Sid, Uid,
+    BackendId, IdCounter, Sid, Uid,
 };
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::time::Instant;
@@ -73,6 +74,28 @@ pub struct Metadata {
     pub write_password_hash: Option<Bytes>,
 }
 
+/// Per-backend channel state — one of these exists per registered `BackendId`,
+/// for the lifetime of the session (not just while connected), so that
+/// messages queued while a backend is briefly disconnected are delivered once
+/// it reconnects, matching the pre-multi-backend reconnect semantics.
+#[derive(Debug)]
+struct BackendChannel {
+    /// Human-readable label (hostname, etc.), from Open()'s implicit
+    /// "primary" registration or Join()'s `backend_name`.
+    name: String,
+
+    /// Whether a `Channel()` stream currently holds this backend's receiver.
+    /// Prevents a second concurrent connection for the same backend_id from
+    /// racing on the same receiver (see docs/phase3-design.md's MPMC finding).
+    connected: Mutex<bool>,
+
+    /// Sender end of a channel that buffers messages for this backend.
+    update_tx: async_channel::Sender<ServerMessage>,
+
+    /// Receiver end of a channel that buffers messages for this backend.
+    update_rx: async_channel::Receiver<ServerMessage>,
+}
+
 /// In-memory state for a single sshx session.
 #[derive(Debug)]
 pub struct Session {
@@ -88,6 +111,14 @@ pub struct Session {
     /// Atomic counter to get new, unique IDs.
     counter: IdCounter,
 
+    /// Registered backends (the "primary" from Open(), plus any from Join()),
+    /// each with its own message channel. Entries persist for the life of the
+    /// session, not just while a gRPC stream is attached.
+    backends: RwLock<HashMap<BackendId, BackendChannel>>,
+
+    /// Round-robin cursor for `pick_backend_for_create`.
+    next_create_backend: AtomicU32,
+
     /// Timestamp of the last backend client message from an active connection.
     last_accessed: Mutex<Instant>,
 
@@ -101,12 +132,6 @@ pub struct Session {
     /// state. Duplicated events should remain consistent.
     broadcast: broadcast::Sender<WsServer>,
 
-    /// Sender end of a channel that buffers messages for the client.
-    update_tx: async_channel::Sender<ServerMessage>,
-
-    /// Receiver end of a channel that buffers messages for the client.
-    update_rx: async_channel::Receiver<ServerMessage>,
-
     /// Triggered from metadata events when an immediate snapshot is needed.
     sync_notify: Notify,
 
@@ -118,7 +143,7 @@ pub struct Session {
 }
 
 /// Internal state for each shell.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct State {
     /// Sequence number, indicating how many bytes have been received.
     seqnum: u64,
@@ -137,23 +162,41 @@ struct State {
 
     /// Updated when any of the above fields change.
     notify: Arc<Notify>,
+
+    /// Which backend owns this shell — Input/Resize/Close route here.
+    backend_id: BackendId,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            seqnum: 0,
+            data: Vec::new(),
+            chunk_offset: 0,
+            byte_offset: 0,
+            closed: false,
+            notify: Arc::default(),
+            backend_id: BackendId::PRIMARY,
+        }
+    }
 }
 
 impl Session {
-    /// Construct a new session.
+    /// Construct a new session. Does NOT register any backend — callers must
+    /// call `register_backend()` (for a fresh `Open()`) or `restore_backend()`
+    /// (once per backend, when restoring from a snapshot) afterwards.
     pub fn new(metadata: Metadata) -> Self {
         let now = Instant::now();
-        let (update_tx, update_rx) = async_channel::bounded(256);
         Session {
             metadata,
             shells: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
             counter: IdCounter::default(),
+            backends: RwLock::new(HashMap::new()),
+            next_create_backend: AtomicU32::new(0),
             last_accessed: Mutex::new(now),
             source: watch::channel(Vec::new()).0,
             broadcast: broadcast::channel(64).0,
-            update_tx,
-            update_rx,
             sync_notify: Notify::new(),
             board: Mutex::new(Vec::new()),
             shutdown: Shutdown::new(),
@@ -163,6 +206,95 @@ impl Session {
     /// Returns the metadata for this session.
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    /// Register a new backend (via `Open()` for the primary, or `Join()` for
+    /// any other), allocating a fresh `BackendId` and message channel.
+    pub fn register_backend(&self, name: String) -> BackendId {
+        let id = self.counter.next_backend_id();
+        self.restore_backend(id, name);
+        id
+    }
+
+    /// Register a backend under a SPECIFIC, already-allocated ID — used only
+    /// when restoring from a snapshot, where backend identities must be
+    /// preserved exactly so already-connected clients can still reconnect.
+    pub fn restore_backend(&self, id: BackendId, name: String) {
+        let (update_tx, update_rx) = async_channel::bounded(256);
+        self.backends.write().insert(
+            id,
+            BackendChannel {
+                name,
+                connected: Mutex::new(false),
+                update_tx,
+                update_rx,
+            },
+        );
+    }
+
+    /// List all registered backends (id, name) — used for the snapshot and
+    /// could back a future "which node is this terminal on" UI.
+    pub fn list_backends(&self) -> Vec<(BackendId, String)> {
+        self.backends
+            .read()
+            .iter()
+            .map(|(id, b)| (*id, b.name.clone()))
+            .collect()
+    }
+
+    /// Attach to a registered backend's channel, for exclusive use by one
+    /// `Channel()` stream at a time. Fails if the backend doesn't exist, or
+    /// already has an active connection (see `BackendChannel::connected`) —
+    /// the latter is what prevents the MPMC race a second concurrent
+    /// connection to the same backend would otherwise cause.
+    pub fn connect_backend(&self, id: BackendId) -> Result<async_channel::Receiver<ServerMessage>> {
+        let backends = self.backends.read();
+        let backend = backends
+            .get(&id)
+            .with_context(|| format!("backend {id} not registered"))?;
+        let mut connected = backend.connected.lock();
+        if *connected {
+            bail!("backend {id} already has an active connection");
+        }
+        *connected = true;
+        Ok(backend.update_rx.clone())
+    }
+
+    /// Release a backend's connection, allowing a future reconnect. Does NOT
+    /// remove the backend or affect its shells — messages sent to it in the
+    /// meantime simply queue in its channel, same as the original
+    /// single-backend reconnect behavior.
+    pub fn disconnect_backend(&self, id: BackendId) {
+        if let Some(backend) = self.backends.read().get(&id) {
+            *backend.connected.lock() = false;
+        }
+    }
+
+    /// Get the sender for a specific backend's channel, for routing messages
+    /// (Input/Resize/Close) from the browser to the backend that owns a
+    /// given shell. Works regardless of current connection state.
+    pub fn backend_sender(&self, id: BackendId) -> Option<async_channel::Sender<ServerMessage>> {
+        self.backends.read().get(&id).map(|b| b.update_tx.clone())
+    }
+
+    /// Pick a backend to receive a newly-created shell when the browser
+    /// doesn't specify one — round-robins over all currently registered
+    /// backends. A real backend-selector UI can replace this later without a
+    /// protocol change (see phase3-design.md).
+    pub fn pick_backend_for_create(&self) -> Option<BackendId> {
+        let backends = self.backends.read();
+        let mut ids: Vec<BackendId> = backends.keys().copied().collect();
+        if ids.is_empty() {
+            return None;
+        }
+        ids.sort();
+        let idx = self.next_create_backend.fetch_add(1, Ordering::Relaxed) as usize % ids.len();
+        Some(ids[idx])
+    }
+
+    /// Look up which backend owns a given shell.
+    pub fn shell_backend(&self, id: Sid) -> Option<BackendId> {
+        self.shells.read().get(&id).map(|s| s.backend_id)
     }
 
     /// Gives access to the ID counter for obtaining new IDs.
@@ -235,17 +367,21 @@ impl Session {
         }
     }
 
-    /// Add a new shell to the session.
-    pub fn add_shell(&self, id: Sid, center: (i32, i32)) -> Result<()> {
+    /// Add a new shell to the session, owned by the given backend.
+    pub fn add_shell(&self, id: Sid, center: (i32, i32), backend_id: BackendId) -> Result<()> {
         use std::collections::hash_map::Entry::*;
         let _guard = match self.shells.write().entry(id) {
             Occupied(_) => bail!("shell already exists with id={id}"),
-            Vacant(v) => v.insert(State::default()),
+            Vacant(v) => v.insert(State {
+                backend_id,
+                ..Default::default()
+            }),
         };
         self.source.send_modify(|source| {
             let winsize = WsWinsize {
                 x: center.0,
                 y: center.1,
+                backend_id: backend_id.0,
                 ..Default::default()
             };
             source.push((id, winsize));
@@ -487,15 +623,6 @@ impl Session {
         *self.last_accessed.lock()
     }
 
-    /// Access the sender of the client message channel for this session.
-    pub fn update_tx(&self) -> &async_channel::Sender<ServerMessage> {
-        &self.update_tx
-    }
-
-    /// Access the receiver of the client message channel for this session.
-    pub fn update_rx(&self) -> &async_channel::Receiver<ServerMessage> {
-        &self.update_rx
-    }
 
     /// Mark the session as requiring an immediate storage sync.
     ///

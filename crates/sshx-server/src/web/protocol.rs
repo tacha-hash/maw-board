@@ -16,6 +16,11 @@ pub struct WsWinsize {
     pub rows: u16,
     /// The number of columns in the terminal.
     pub cols: u16,
+    /// Which backend (physical node) this shell runs on. Wired through now
+    /// so a future per-backend badge/color UI doesn't need another protocol
+    /// change — frontends that don't use it yet can just ignore the field.
+    #[serde(default)]
+    pub backend_id: u32,
 }
 
 impl Default for WsWinsize {
@@ -29,6 +34,7 @@ impl Default for WsWinsize {
             // still let users override (XTerm.svelte).
             rows: 40,
             cols: 80,
+            backend_id: 0,
         }
     }
 }

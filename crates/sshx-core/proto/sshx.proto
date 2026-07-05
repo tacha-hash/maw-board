@@ -8,6 +8,9 @@ service SshxService {
   // Create a new SSH session for a given computer.
   rpc Open(OpenRequest) returns (OpenResponse);
 
+  // Join an existing session as an additional backend.
+  rpc Join(JoinRequest) returns (JoinResponse);
+
   // Stream real-time commands and terminal outputs to the session.
   rpc Channel(stream ClientUpdate) returns (stream ServerUpdate);
 
@@ -46,9 +49,25 @@ message OpenRequest {
 
 // Details of a newly-created sshx session.
 message OpenResponse {
-  string name = 1;  // Name of the session.
-  string token = 2; // Signed verification token for the client.
-  string url = 3;   // Public web URL to view the session.
+  string name = 1;       // Name of the session.
+  string token = 2;      // Signed verification token for the client (this backend's, id 0).
+  string url = 3;        // Public web URL to view the session.
+  string join_token = 4; // Signed token authorizing another backend to Join() this session.
+}
+
+// Request to join an existing sshx session as an additional backend.
+message JoinRequest {
+  string origin = 1;         // Web origin of the server.
+  string name = 2;           // Name of the existing session to join.
+  string join_token = 3;     // From OpenResponse.join_token — authorizes joining.
+  bytes encrypted_zeros = 4; // MUST match the session's stored value (same encryption key).
+  string backend_name = 5;   // Human-readable label for this backend (e.g. hostname).
+}
+
+// Details of a successful join.
+message JoinResponse {
+  uint32 backend_id = 1; // This backend's ID within the session (never 0 — that's the primary).
+  string token = 2;      // Signed verification token for THIS backend's reconnection.
 }
 
 // Sequence numbers for all active shells, used for synchronization.
@@ -63,14 +82,23 @@ message NewShell {
   int32 y = 3;   // Y position of the shell.
 }
 
+// First-message identification for a backend joined via Join(), naming which
+// backend_id it is (rather than always being the implicit primary, id 0).
+message HelloBackend {
+  string name = 1;
+  string token = 2;
+  uint32 backend_id = 3;
+}
+
 // Bidirectional streaming update from the client.
 message ClientUpdate {
   oneof client_message {
-    string hello = 1;           // First stream message: "name,token".
-    TerminalData data = 2;      // Stream data from the terminal.
-    NewShell created_shell = 3; // Acknowledge that a new shell was created.
-    uint32 closed_shell = 4;    // Acknowledge that a shell was closed.
-    fixed64 pong = 14;          // Response for latency measurement.
+    string hello = 1;                 // First stream message: "name,token". Always backend_id 0.
+    TerminalData data = 2;            // Stream data from the terminal.
+    NewShell created_shell = 3;       // Acknowledge that a new shell was created.
+    uint32 closed_shell = 4;          // Acknowledge that a shell was closed.
+    HelloBackend hello_backend = 16;  // First stream message for a Join()'d backend.
+    fixed64 pong = 14;                // Response for latency measurement.
     string error = 15;
   }
 }
@@ -117,6 +145,8 @@ message SerializedSession {
   string name = 5;
   optional bytes write_password_hash = 6;
   repeated SerializedBoardItem board_items = 7;
+  uint32 next_backend_id = 8;              // next unallocated BackendId
+  map<uint32, string> backend_names = 9;   // backend_id -> human label, for all registered backends
 }
 
 message SerializedShell {
@@ -129,4 +159,5 @@ message SerializedShell {
   int32 winsize_y = 7;
   uint32 winsize_rows = 8;
   uint32 winsize_cols = 9;
+  uint32 backend_id = 10; // which backend owns this shell — required for correct routing on restore
 }

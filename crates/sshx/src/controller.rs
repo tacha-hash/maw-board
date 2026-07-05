@@ -6,7 +6,8 @@ use std::pin::pin;
 use anyhow::{Context, Result};
 use sshx_core::proto::{
     client_update::ClientMessage, server_update::ServerMessage,
-    sshx_service_client::SshxServiceClient, ClientUpdate, CloseRequest, NewShell, OpenRequest,
+    sshx_service_client::SshxServiceClient, ClientUpdate, CloseRequest, HelloBackend, JoinRequest,
+    NewShell, OpenRequest,
 };
 use sshx_core::{rand_alphanumeric, Sid};
 use tokio::sync::mpsc;
@@ -36,6 +37,14 @@ pub struct Controller {
     token: String,
     url: String,
     write_url: Option<String>,
+    /// Only set for the primary backend — authorizes another backend to
+    /// `Join()` this session. `None` for a Controller constructed via `join()`.
+    join_token: Option<String>,
+
+    /// `None` for the primary backend (from `Open()`, uses the plain `Hello`
+    /// handshake for compatibility with the original protocol); `Some(id)`
+    /// for a backend registered via `Join()`, using `HelloBackend`.
+    backend_id: Option<u32>,
 
     /// Channels with backpressure routing messages to each shell task.
     shells_tx: HashMap<Sid, mpsc::Sender<ShellData>>,
@@ -105,6 +114,59 @@ impl Controller {
             token: resp.token,
             url: resp.url,
             write_url,
+            join_token: Some(resp.join_token),
+            backend_id: None,
+            shells_tx: HashMap::new(),
+            output_tx,
+            output_rx,
+        })
+    }
+
+    /// Join an existing session as an additional backend. `encryption_key`
+    /// MUST be the same key the session was originally opened with (e.g.
+    /// copied from its URL fragment) — this is what lets this backend's
+    /// terminal data be decrypted by browsers already viewing the session,
+    /// and is verified server-side against the session's stored
+    /// `encrypted_zeros` (see `Join()` on the server; a mismatched key is
+    /// rejected rather than silently producing undecryptable data).
+    pub async fn join(
+        origin: &str,
+        join_name: &str,
+        join_token: &str,
+        encryption_key: &str,
+        backend_name: &str,
+        runner: Runner,
+    ) -> Result<Self> {
+        debug!(%origin, %join_name, "joining existing session");
+        let encrypt = Encrypt::new(encryption_key);
+
+        let mut client = Self::connect(origin).await?;
+        let req = JoinRequest {
+            origin: origin.into(),
+            name: join_name.into(),
+            join_token: join_token.into(),
+            encrypted_zeros: encrypt.zeros().into(),
+            backend_name: backend_name.into(),
+        };
+        let resp = client.join(req).await?.into_inner();
+
+        // No `OpenResponse.url` is returned by `Join()` — the joining
+        // backend doesn't need its own viewer URL, only the original
+        // session's. Reconstruct enough of a URL for logging/consistency.
+        let url = format!("{origin}/s/{join_name}#{encryption_key}");
+
+        let (output_tx, output_rx) = mpsc::channel(64);
+        Ok(Self {
+            origin: origin.into(),
+            runner,
+            encrypt,
+            encryption_key: encryption_key.into(),
+            name: join_name.into(),
+            token: resp.token,
+            url,
+            write_url: None,
+            join_token: None,
+            backend_id: Some(resp.backend_id),
             shells_tx: HashMap::new(),
             output_tx,
             output_rx,
@@ -121,6 +183,11 @@ impl Controller {
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .expect("invalid user agent");
         SshxServiceClient::connect(endpoint).await
+    }
+
+    /// Returns the gRPC origin this controller connects to.
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// Returns the name of the session.
@@ -141,6 +208,18 @@ impl Controller {
     /// Returns the encryption key for this session, hidden from the server.
     pub fn encryption_key(&self) -> &str {
         &self.encryption_key
+    }
+
+    /// Returns the token authorizing another backend to `Join()` this
+    /// session, if this Controller is the primary backend.
+    pub fn join_token(&self) -> Option<&str> {
+        self.join_token.as_deref()
+    }
+
+    /// Whether this Controller is the primary backend (from `Open()`) rather
+    /// than one that joined via `Join()`.
+    pub fn is_primary(&self) -> bool {
+        self.backend_id.is_none()
     }
 
     /// Run the controller forever, listening for requests from the server.
@@ -165,7 +244,14 @@ impl Controller {
     async fn try_channel(&mut self) -> Result<()> {
         let (tx, rx) = mpsc::channel(16);
 
-        let hello = ClientMessage::Hello(format!("{},{}", self.name, self.token));
+        let hello = match self.backend_id {
+            None => ClientMessage::Hello(format!("{},{}", self.name, self.token)),
+            Some(backend_id) => ClientMessage::HelloBackend(HelloBackend {
+                name: self.name.clone(),
+                token: self.token.clone(),
+                backend_id,
+            }),
+        };
         send_msg(&tx, hello).await?;
 
         let mut client = Self::connect(&self.origin).await?;
@@ -278,6 +364,15 @@ impl Controller {
 
     /// Terminate this session gracefully.
     pub async fn close(&self) -> Result<()> {
+        // Only the primary backend can close the whole session — a joined
+        // backend's token would be rejected by the server anyway (it's
+        // derived differently, see docs/phase3-design.md), but skip the RPC
+        // entirely rather than let it round-trip and fail. Just disconnecting
+        // (dropping this Controller) is a joined backend's correct "leave."
+        if self.backend_id.is_some() {
+            debug!("joined backend disconnecting (not closing the whole session)");
+            return Ok(());
+        }
         debug!("closing session");
         let req = CloseRequest {
             name: self.name.clone(),

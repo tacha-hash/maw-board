@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use sshx::{controller::Controller, encrypt::Encrypt, runner::Runner};
 use sshx_core::{
     proto::{server_update::ServerMessage, NewShell, TerminalInput},
-    Sid, Uid,
+    BackendId, Sid, Uid,
 };
 use sshx_server::{
     web::protocol::{WsClient, WsWinsize},
@@ -45,7 +45,9 @@ async fn test_command() -> Result<()> {
         .lookup(controller.name())
         .context("couldn't find session in server state")?;
 
-    let updates = session.update_tx();
+    let updates = session
+        .backend_sender(BackendId::PRIMARY)
+        .context("primary backend not registered")?;
     let new_shell = NewShell { id: 1, x: 0, y: 0 };
     updates.send(ServerMessage::CreateShell(new_shell)).await?;
 
@@ -139,6 +141,7 @@ async fn test_ws_resize() -> Result<()> {
         y: 105,
         rows: 200,
         cols: 20,
+        backend_id: 0,
     };
     s.send(WsClient::Move(Sid(1), Some(new_size))).await;
     s.send(WsClient::Move(Sid(2), Some(new_size))).await; // error: does not exist

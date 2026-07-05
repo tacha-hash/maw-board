@@ -6,7 +6,7 @@ use anyhow::{ensure, Context, Result};
 use prost::Message;
 use sshx_core::{
     proto::{SerializedBoardItem, SerializedSession, SerializedShell},
-    Sid, Uid,
+    BackendId, Sid, Uid,
 };
 
 use super::{Metadata, Session, State};
@@ -56,6 +56,7 @@ impl Session {
                         winsize_y: winsize.y,
                         winsize_rows: winsize.rows.into(),
                         winsize_cols: winsize.cols.into(),
+                        backend_id: shell.backend_id.0,
                     };
                     (sid.0, shell)
                 })
@@ -64,6 +65,12 @@ impl Session {
             next_uid: ids.1 .0,
             name: self.metadata().name.clone(),
             write_password_hash: self.metadata().write_password_hash.clone(),
+            next_backend_id: self.counter.get_backend_counter(),
+            backend_names: self
+                .list_backends()
+                .into_iter()
+                .map(|(id, name)| (id.0, name))
+                .collect(),
             board_items: self
                 .board
                 .lock()
@@ -96,6 +103,18 @@ impl Session {
         };
 
         let session = Self::new(metadata);
+
+        // Restore backend identities BEFORE shells, since shells reference
+        // backend_id and routing depends on the backend already being
+        // registered (with a fresh channel — the old gRPC connections don't
+        // survive a restart, but the identities and any already-queued
+        // messages' *destinations* must line up when those backends
+        // reconnect).
+        for (id, name) in message.backend_names {
+            session.restore_backend(BackendId(id), name);
+        }
+        session.counter.set_backend_counter(message.next_backend_id);
+
         let mut shells = session.shells.write();
         let mut winsizes = Vec::new();
         for (sid, shell) in message.shells {
@@ -106,6 +125,7 @@ impl Session {
                     y: shell.winsize_y,
                     rows: shell.winsize_rows.try_into().context("rows overflow")?,
                     cols: shell.winsize_cols.try_into().context("cols overflow")?,
+                    backend_id: shell.backend_id,
                 },
             ));
             let shell = State {
@@ -115,6 +135,7 @@ impl Session {
                 byte_offset: shell.byte_offset,
                 closed: shell.closed,
                 notify: Default::default(),
+                backend_id: BackendId(shell.backend_id),
             };
             shells.insert(Sid(sid), shell);
         }

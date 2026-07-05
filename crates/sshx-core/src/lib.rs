@@ -50,11 +50,32 @@ impl Display for Uid {
     }
 }
 
+/// Unique identifier for a backend (a distinct `sshx` client process) within
+/// the session. Backend 0 is always the "primary" — whichever backend called
+/// `Open()` — and is the only one whose reconnect token uses the original,
+/// pre-multi-backend derivation for compatibility with old clients. Backends
+/// 1+ are registered via `Join()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BackendId(pub u32);
+
+impl BackendId {
+    /// The implicit backend registered when a session is created via `Open()`.
+    pub const PRIMARY: BackendId = BackendId(0);
+}
+
+impl Display for BackendId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A counter for generating unique identifiers.
 #[derive(Debug)]
 pub struct IdCounter {
     next_sid: AtomicU32,
     next_uid: AtomicU32,
+    next_backend_id: AtomicU32,
 }
 
 impl Default for IdCounter {
@@ -62,6 +83,7 @@ impl Default for IdCounter {
         Self {
             next_sid: AtomicU32::new(1),
             next_uid: AtomicU32::new(1),
+            next_backend_id: AtomicU32::new(0), // first call returns BackendId::PRIMARY (0)
         }
     }
 }
@@ -77,6 +99,12 @@ impl IdCounter {
         Uid(self.next_uid.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Returns the next unique backend ID. The first call after a fresh
+    /// session always returns `BackendId::PRIMARY`.
+    pub fn next_backend_id(&self) -> BackendId {
+        BackendId(self.next_backend_id.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Return the current internal values of the counter.
     pub fn get_current_values(&self) -> (Sid, Uid) {
         (
@@ -89,5 +117,15 @@ impl IdCounter {
     pub fn set_current_values(&self, sid: Sid, uid: Uid) {
         self.next_sid.store(sid.0, Ordering::Relaxed);
         self.next_uid.store(uid.0, Ordering::Relaxed);
+    }
+
+    /// Return the current value of the backend ID counter (for persistence).
+    pub fn get_backend_counter(&self) -> u32 {
+        self.next_backend_id.load(Ordering::Relaxed)
+    }
+
+    /// Set the backend ID counter (when restoring from a snapshot).
+    pub fn set_backend_counter(&self, next_backend_id: u32) {
+        self.next_backend_id.store(next_backend_id, Ordering::Relaxed);
     }
 }

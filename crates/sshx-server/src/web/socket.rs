@@ -129,7 +129,6 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
 
     let _user_guard = session.user_scope(user_id, can_write)?;
 
-    let update_tx = session.update_tx(); // start listening for updates before any state reads
     let mut broadcast_stream = session.subscribe_broadcast();
     send(socket, WsServer::Users(session.list_users())).await?;
     send(socket, WsServer::Board(session.board_snapshot())).await?;
@@ -180,6 +179,20 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
+                // Round-robins over registered backends for now — no wire
+                // format change needed to add a backend selector here yet,
+                // since the frontend doesn't have a picker UI (deferred, see
+                // docs/phase3-design.md). A session with zero backends
+                // shouldn't be reachable (Open()/Join() always register one),
+                // but fail cleanly rather than panic if it somehow happens.
+                let Some(backend_id) = session.pick_backend_for_create() else {
+                    send(socket, WsServer::Error("no backend available".into())).await?;
+                    continue;
+                };
+                let Some(update_tx) = session.backend_sender(backend_id) else {
+                    send(socket, WsServer::Error("no backend available".into())).await?;
+                    continue;
+                };
                 let id = session.counter().next_sid();
                 session.sync_now();
                 let new_shell = NewShell { id: id.0, x, y };
@@ -192,6 +205,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
+                let Some(update_tx) = session.shell_backend(id).and_then(|b| session.backend_sender(b)) else {
+                    send(socket, WsServer::Error("shell has no owning backend".into())).await?;
+                    continue;
+                };
                 update_tx.send(ServerMessage::CloseShell(id.0)).await?;
             }
             WsClient::Move(id, winsize) => {
@@ -209,7 +226,9 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                         rows: winsize.rows as u32,
                         cols: winsize.cols as u32,
                     });
-                    session.update_tx().send(msg).await?;
+                    if let Some(update_tx) = session.shell_backend(id).and_then(|b| session.backend_sender(b)) {
+                        update_tx.send(msg).await?;
+                    }
                 }
             }
             WsClient::Data(id, data, offset) => {
@@ -217,6 +236,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
+                let Some(update_tx) = session.shell_backend(id).and_then(|b| session.backend_sender(b)) else {
+                    send(socket, WsServer::Error("shell has no owning backend".into())).await?;
+                    continue;
+                };
                 let input = TerminalInput {
                     id: id.0,
                     data,

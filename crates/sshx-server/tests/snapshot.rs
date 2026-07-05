@@ -33,6 +33,7 @@ async fn test_basic_restore() -> Result<()> {
         y: 105,
         rows: 200,
         cols: 20,
+        backend_id: 0,
     };
 
     s.send_input(Sid(1), b"hello there!").await;
