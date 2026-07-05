@@ -303,11 +303,18 @@ impl Session {
     }
 
     /// Return the sequence numbers for current shells.
-    pub fn sequence_numbers(&self) -> SequenceNumbers {
+    /// Sequence numbers for shells owned by ONE specific backend. Each
+    /// backend's `Channel()` connection must only ever be sent sync info for
+    /// its OWN shells: a backend that sees a Sid it doesn't recognize
+    /// responds by telling the server to close it (a stale-state cleanup
+    /// mechanism from the single-backend design) — sending it every
+    /// backend's shells indiscriminately would have every OTHER backend's
+    /// shells reported as unknown and closed within seconds of creation.
+    pub fn sequence_numbers(&self, backend_id: BackendId) -> SequenceNumbers {
         let shells = self.shells.read();
-        let mut map = HashMap::with_capacity(shells.len());
+        let mut map = HashMap::new();
         for (key, value) in &*shells {
-            if !value.closed {
+            if !value.closed && value.backend_id == backend_id {
                 map.insert(key.0, value.seqnum);
             }
         }

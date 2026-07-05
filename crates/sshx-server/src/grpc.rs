@@ -261,7 +261,7 @@ async fn handle_streaming(
         tokio::select! {
             // Send periodic sync messages to the client.
             _ = sync_interval.tick() => {
-                let msg = ServerMessage::Sync(session.sequence_numbers());
+                let msg = ServerMessage::Sync(session.sequence_numbers(backend_id));
                 if !send_msg(tx, msg).await {
                     return Err("failed to send sync message");
                 }
