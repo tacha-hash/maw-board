@@ -29,6 +29,7 @@
   import { RtcMesh } from "./rtc";
   import { makeToast } from "./toast";
   import { saveKey, removeKey } from "./boardKeys";
+  import { parseJobPayload } from "./jobPayload";
   import {
     computeSnap,
     computeSnapTarget,
@@ -1225,64 +1226,27 @@
         provider: "kie",
         input_image_ids: [],
         state: "draft",
+        media_type: "image",
       }),
     };
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
   }
 
-  // Parses a "job" item's dataUrl — same defensive-parse pattern as
-  // linkEndpoints/boardLock (malformed/partial JSON must never throw here).
+  // job "item" parsing/defaults now live in ./jobPayload, shared with
+  // Board.svelte — see docs/vision-round3-gen-nodes-design.md. Two
+  // independently hand-copied parsers is exactly the pattern that caused
+  // the lobby "Need key" bug (PROGRESS.md 2026-07-07 00:05); this collapses
+  // it back to one before it happens again.
+  //
   // IMPORTANT: the bridge treats a *missing* `state` as immediately
   // processable (its guard is `payload.state && payload.state !== "pending"`)
   // — so a draft MUST carry an explicit `state: "draft"`, never omit it,
   // or the bridge starts generating on the very first keystroke.
-  // aspect_ratio/resolution/provider/input_image_ids are dottodot-parity
-  // fields (PLAN.md, additive, snake_case to match Kie's own param names) —
-  // all optional on the wire, defaulted here.
-  function parseJobPayload(dataUrl: string): {
-    prompt: string;
-    model: string;
-    aspect_ratio: string;
-    resolution: string;
-    provider: string;
-    input_image_ids: string[];
-    state: "draft" | "pending" | "running" | "done" | "error";
-    error?: string;
-  } {
-    try {
-      const p = JSON.parse(dataUrl);
-      const state = ["draft", "pending", "running", "done", "error"].includes(p.state)
-        ? p.state
-        : "draft";
-      return {
-        prompt: typeof p.prompt === "string" ? p.prompt : "",
-        model: typeof p.model === "string" ? p.model : "nano-banana",
-        aspect_ratio: typeof p.aspect_ratio === "string" ? p.aspect_ratio : "1:1",
-        resolution: typeof p.resolution === "string" ? p.resolution : "1K",
-        provider: typeof p.provider === "string" ? p.provider : "kie",
-        input_image_ids: Array.isArray(p.input_image_ids)
-          ? p.input_image_ids.filter((x: unknown) => typeof x === "string")
-          : [],
-        state,
-        error: typeof p.error === "string" ? p.error : undefined,
-      };
-    } catch {
-      return {
-        prompt: "",
-        model: "nano-banana",
-        aspect_ratio: "1:1",
-        resolution: "1K",
-        provider: "kie",
-        input_image_ids: [],
-        state: "draft",
-      };
-    }
-  }
 
-  // Prompt/model/aspect-ratio/resolution/provider edits from the JobNode UI
-  // — only while still a draft, so a stray keystroke can't fight the bridge
-  // mid-generation.
+  // Prompt/model/aspect-ratio/resolution/provider/media_type/duration/
+  // negative_prompt edits from the JobNode UI — only while still a draft,
+  // so a stray keystroke can't fight the bridge mid-generation.
   function handleJobEdit(
     id: string,
     patch: {
@@ -1291,6 +1255,9 @@
       aspect_ratio?: string;
       resolution?: string;
       provider?: string;
+      media_type?: "image" | "video";
+      duration?: number;
+      negative_prompt?: string;
     },
   ) {
     if (!canEdit) return;
@@ -1326,6 +1293,35 @@
     const job = parseJobPayload(item.dataUrl);
     const input_image_ids = job.input_image_ids.filter((_, i) => i !== index);
     const updated = { ...item, dataUrl: JSON.stringify({ ...job, input_image_ids }) };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  // Vision Round 3 — i2v end-frame reference (single slot, separate from
+  // the i2i input_image_ids list; dragged from an image tile the same way).
+  function handleJobSetEndFrame(id: string, imageItemId: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    if (job.state !== "draft") return;
+    const updated = {
+      ...item,
+      dataUrl: JSON.stringify({ ...job, end_frame_image_id: imageItemId }),
+    };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  function handleJobClearEndFrame(id: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    const updated = {
+      ...item,
+      dataUrl: JSON.stringify({ ...job, end_frame_image_id: undefined }),
+    };
     upsertBoardItem(updated);
     srocket?.send({ boardPut: updated });
   }
@@ -2817,6 +2813,8 @@
       on:jobRetry={({ detail }) => handleJobRetry(detail)}
       on:jobAddImageRef={({ detail }) => handleJobAddImageRef(detail.id, detail.imageItemId)}
       on:jobRemoveImageRef={({ detail }) => handleJobRemoveImageRef(detail.id, detail.index)}
+      on:jobSetEndFrame={({ detail }) => handleJobSetEndFrame(detail.id, detail.imageItemId)}
+      on:jobClearEndFrame={({ detail }) => handleJobClearEndFrame(detail)}
     />
 
     {#if contextMenu}

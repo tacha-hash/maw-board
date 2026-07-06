@@ -10,11 +10,15 @@
     AlertTriangleIcon,
     MaximizeIcon,
     PaperclipIcon,
+    ImageIcon,
+    VideoIcon,
   } from "svelte-feather-icons";
 
   import { slide } from "../action/slide";
   import { computeSnap, type SnapRect } from "../snap";
   import type { BoardItem } from "../protocol";
+  import { parseJobPayload as parseJob, type JobPayload } from "../jobPayload";
+  import { findGenModel, brandGroupsFor, modelsFor, type GenModel } from "../genModels";
 
   /** Board items (images + screen-share placeholder tiles). */
   export let items: BoardItem[];
@@ -45,9 +49,18 @@
   let guidesV: number[] = [];
   let guidesH: number[] = [];
 
-  // dottodot parity: full-size image viewer, opened from any image/video
-  // tile's 🔍 button or a job node's result thumbnail.
+  // dottodot parity: full-size image/video viewer, opened from any
+  // image/video tile's 🔍 button or a job node's result thumbnail.
   let lightboxSrc: string | null = null;
+  let lightboxIsVideo = false;
+  function openLightbox(src: string, isVideo = false) {
+    lightboxSrc = src;
+    lightboxIsVideo = isVideo;
+  }
+  function closeLightbox() {
+    lightboxSrc = null;
+    lightboxIsVideo = false;
+  }
 
   const dispatch = createEventDispatcher<{
     move: { id: string; x: number; y: number };
@@ -61,6 +74,9 @@
       aspect_ratio?: string;
       resolution?: string;
       provider?: string;
+      media_type?: "image" | "video";
+      duration?: number;
+      negative_prompt?: string;
     };
     jobGenerate: string;
     jobRetry: string;
@@ -68,83 +84,27 @@
     jobAddImageRef: { id: string; imageItemId: string };
     /** Remove one reference image by index. */
     jobRemoveImageRef: { id: string; index: number };
+    /** An i2v end-frame reference (dragged from an image tile) was dropped onto this job node. */
+    jobSetEndFrame: { id: string; imageItemId: string };
+    jobClearEndFrame: string;
   }>();
 
-  // ── Image-gen job node — dataUrl is a JSON payload, not raw text (see
-  // docs/round2-frontend-design.md). Parsed defensively like every other
-  // JSON-payload board item (link/lock precedent) since a malformed/partial
-  // dataUrl must never crash the render loop.
+  // ── Gen job node (image or video) — dataUrl is a JSON payload, not raw
+  // text (see docs/round2-frontend-design.md, docs/vision-round3-gen-nodes-
+  // design.md). Parsing lives in ../jobPayload (shared with Session.svelte)
+  // — a malformed/partial dataUrl must never crash the render loop.
   //
-  // Field names/values here MUST match tools/board-bridge.ts exactly (it's
-  // the live consumer, not a spec we control): `state`, not `status`; a
-  // *draft* job must carry an explicit `state: "draft"` — the bridge treats
-  // a MISSING state as immediately processable ("pending"-equivalent), so
+  // Field names/values MUST match tools/board-bridge.ts exactly (it's the
+  // live consumer, not a spec we control): `state`, not `status`; a *draft*
+  // job must carry an explicit `state: "draft"` — the bridge treats a
+  // MISSING state as immediately processable ("pending"-equivalent), so
   // omitting it while the user is still typing would make the bridge start
   // generating on every keystroke.
-  type JobState = "draft" | "pending" | "running" | "done" | "error";
-  // dottodot parity fields (PLAN.md, agreed 2026-07-06 ค่ำ) — additive, all
-  // optional on the wire, snake_case to match Kie's own API param names
-  // (runKieJob's body shape in board-bridge.ts) rather than camelCase.
-  type JobPayload = {
-    prompt: string;
-    model: string;
-    aspect_ratio: string;
-    resolution: string;
-    provider: string;
-    input_image_ids: string[];
-    state: JobState;
-    error?: string;
-  };
-  // Must match board-bridge.ts's MODEL_ALIASES keys exactly (confirmed by
-  // reading its source, commit 0f7f6d3) — anything else passes through to
-  // Kie unaliased and 422s (found live: "seedream" alone isn't a valid Kie
-  // model id, needs the "bytedance/seedream" the bridge maps it to).
-  const MODEL_BRANDS: { brand: string; models: string[] }[] = [
-    { brand: "Google", models: ["nano-banana"] },
-    { brand: "Black Forest Labs", models: ["flux"] },
-    { brand: "ByteDance", models: ["seedream"] },
-    { brand: "OpenAI", models: ["gpt-image"] },
-  ];
-  const JOB_MODELS = MODEL_BRANDS.flatMap((b) => b.models);
-  const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"];
-  const RESOLUTIONS = ["1K", "2K", "4K"];
+  //
   // "fal"/"novita" show in the UI ahead of bridge support (Le: "เดี๋ยว bridge
   // ผมตามรองรับ") — picking them is harmless today, bridge currently only
   // implements "kie" and ignores the field entirely otherwise.
   const PROVIDERS = ["kie", "fal", "novita"];
-
-  function parseJob(dataUrl: string): JobPayload {
-    try {
-      const parsed = JSON.parse(dataUrl);
-      const state: JobState = ["draft", "pending", "running", "done", "error"].includes(
-        parsed.state,
-      )
-        ? parsed.state
-        : "draft";
-      return {
-        prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
-        model: typeof parsed.model === "string" ? parsed.model : JOB_MODELS[0],
-        aspect_ratio: typeof parsed.aspect_ratio === "string" ? parsed.aspect_ratio : ASPECT_RATIOS[0],
-        resolution: typeof parsed.resolution === "string" ? parsed.resolution : RESOLUTIONS[0],
-        provider: typeof parsed.provider === "string" ? parsed.provider : PROVIDERS[0],
-        input_image_ids: Array.isArray(parsed.input_image_ids)
-          ? parsed.input_image_ids.filter((x: unknown) => typeof x === "string")
-          : [],
-        state,
-        error: typeof parsed.error === "string" ? parsed.error : undefined,
-      };
-    } catch {
-      return {
-        prompt: "",
-        model: JOB_MODELS[0],
-        aspect_ratio: ASPECT_RATIOS[0],
-        resolution: RESOLUTIONS[0],
-        provider: PROVIDERS[0],
-        input_image_ids: [],
-        state: "draft",
-      };
-    }
-  }
 
   // Resize state — drag the bottom-right handle to stretch a tile (like a window).
   const MIN_W = 120;
@@ -215,12 +175,25 @@
   // detection lives entirely here. `jobTileWrappers` binds each job node's
   // element for hit-testing (same technique termWrappers uses elsewhere).
   const jobTileWrappers: Record<string, HTMLDivElement> = {};
+  // End-frame slots (Vision Round 3 — video i2v) are a smaller, more specific
+  // drop target nested inside a job node — checked first so dropping exactly
+  // on the end-frame box doesn't get swallowed by the whole-node ref target.
+  const endFrameSlotWrappers: Record<string, HTMLDivElement> = {};
   let imageDragImageId: string | null = null;
   let imageDragPointerId: number | null = null;
   let dropTargetJobId: string | null = null;
+  let dropTargetEndFrameId: string | null = null;
 
   function findJobUnderPoint(x: number, y: number): string | null {
     for (const [id, el] of Object.entries(jobTileWrappers)) {
+      const r = el.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id;
+    }
+    return null;
+  }
+
+  function findEndFrameSlotUnderPoint(x: number, y: number): string | null {
+    for (const [id, el] of Object.entries(endFrameSlotWrappers)) {
       const r = el.getBoundingClientRect();
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id;
     }
@@ -240,14 +213,20 @@
 
   function onImageDragMove(event: PointerEvent) {
     if (imageDragImageId === null || event.pointerId !== imageDragPointerId) return;
-    dropTargetJobId = findJobUnderPoint(event.clientX, event.clientY);
+    dropTargetEndFrameId = findEndFrameSlotUnderPoint(event.clientX, event.clientY);
+    dropTargetJobId = dropTargetEndFrameId ? null : findJobUnderPoint(event.clientX, event.clientY);
   }
 
   function endImageDrag(event: PointerEvent) {
     if (imageDragImageId === null || event.pointerId !== imageDragPointerId) return;
-    const targetId = findJobUnderPoint(event.clientX, event.clientY);
-    if (targetId) {
-      dispatch("jobAddImageRef", { id: targetId, imageItemId: imageDragImageId });
+    const endFrameId = findEndFrameSlotUnderPoint(event.clientX, event.clientY);
+    if (endFrameId) {
+      dispatch("jobSetEndFrame", { id: endFrameId, imageItemId: imageDragImageId });
+    } else {
+      const targetId = findJobUnderPoint(event.clientX, event.clientY);
+      if (targetId) {
+        dispatch("jobAddImageRef", { id: targetId, imageItemId: imageDragImageId });
+      }
     }
     cleanupImageDrag();
   }
@@ -260,6 +239,7 @@
     imageDragImageId = null;
     imageDragPointerId = null;
     dropTargetJobId = null;
+    dropTargetEndFrameId = null;
     window.removeEventListener("pointermove", onImageDragMove);
     window.removeEventListener("pointerup", endImageDrag);
     window.removeEventListener("pointercancel", cancelImageDrag);
@@ -482,6 +462,8 @@
         {@const job = parseJob(item.dataUrl)}
         {@const editable = job.state === "draft"}
         {@const outItem = job.state === "done" ? items.find((it) => it.id === `${item.id}-out`) : undefined}
+        {@const modelConfig = findGenModel(job.model)}
+        {@const endFrameItem = job.end_frame_image_id ? items.find((it) => it.id === job.end_frame_image_id) : undefined}
         <div
           class="job-node"
           style:height="{item.h}px"
@@ -489,22 +471,46 @@
           bind:this={jobTileWrappers[item.id]}
         >
           <div class="job-head">
-            <span class="job-title">🎨 Image Gen</span>
+            <span class="job-title">{job.media_type === "video" ? "🎬 Video Gen" : "🎨 Image Gen"}</span>
+            <div class="media-type-toggle">
+              <button
+                class="media-type-btn"
+                class:selected={job.media_type !== "video"}
+                title="Image"
+                disabled={hasWriteAccess === false || !editable}
+                on:pointerdown={(event) => event.stopPropagation()}
+                on:click={() =>
+                  dispatch("jobEdit", { id: item.id, media_type: "image", model: modelsFor("image")[0].id })}
+              >
+                <ImageIcon size="12" />
+              </button>
+              <button
+                class="media-type-btn"
+                class:selected={job.media_type === "video"}
+                title="Video"
+                disabled={hasWriteAccess === false || !editable}
+                on:pointerdown={(event) => event.stopPropagation()}
+                on:click={() =>
+                  dispatch("jobEdit", { id: item.id, media_type: "video", model: modelsFor("video")[0].id })}
+              >
+                <VideoIcon size="12" />
+              </button>
+            </div>
           </div>
 
           <div class="job-section">
             <span class="job-label">Model</span>
             <div class="model-grid">
-              {#each MODEL_BRANDS as group}
+              {#each brandGroupsFor(job.media_type) as group}
                 {#each group.models as m}
                   <button
                     class="model-chip"
-                    class:selected={job.model === m}
+                    class:selected={job.model === m.id}
                     disabled={hasWriteAccess === false || !editable}
                     on:pointerdown={(event) => event.stopPropagation()}
-                    on:click={() => dispatch("jobEdit", { id: item.id, model: m })}
+                    on:click={() => dispatch("jobEdit", { id: item.id, model: m.id })}
                   >
-                    <span class="model-name">{m}</span>
+                    <span class="model-name">{m.name}</span>
                     <span class="model-brand">{group.brand}</span>
                   </button>
                 {/each}
@@ -514,7 +520,7 @@
 
           <textarea
             class="job-prompt"
-            placeholder="Describe the image…"
+            placeholder={job.media_type === "video" ? "Describe a video…" : "Describe the image…"}
             value={job.prompt}
             readonly={hasWriteAccess === false || !editable}
             on:pointerdown={(event) => event.stopPropagation()}
@@ -525,10 +531,25 @@
               })}
           />
 
+          {#if modelConfig?.hasNegativePrompt}
+            <textarea
+              class="job-prompt job-negative-prompt"
+              placeholder="Negative prompt (things to avoid)…"
+              value={job.negative_prompt ?? ""}
+              readonly={hasWriteAccess === false || !editable}
+              on:pointerdown={(event) => event.stopPropagation()}
+              on:input={(event) =>
+                dispatch("jobEdit", {
+                  id: item.id,
+                  negative_prompt: event.currentTarget.value,
+                })}
+            />
+          {/if}
+
           <div class="job-section">
             <span class="job-label">Aspect Ratio</span>
             <div class="chip-row">
-              {#each ASPECT_RATIOS as ar}
+              {#each modelConfig?.aspectRatios ?? [] as ar}
                 <button
                   class="chip"
                   class:selected={job.aspect_ratio === ar}
@@ -545,7 +566,7 @@
           <div class="job-section">
             <span class="job-label">Resolution</span>
             <div class="chip-row">
-              {#each RESOLUTIONS as res}
+              {#each modelConfig?.resolutions ?? [] as res}
                 <button
                   class="chip"
                   class:selected={job.resolution === res}
@@ -558,6 +579,25 @@
               {/each}
             </div>
           </div>
+
+          {#if modelConfig?.durations?.length}
+            <div class="job-section">
+              <span class="job-label">Duration</span>
+              <div class="chip-row">
+                {#each modelConfig.durations as d}
+                  <button
+                    class="chip"
+                    class:selected={job.duration === d}
+                    disabled={hasWriteAccess === false || !editable}
+                    on:pointerdown={(event) => event.stopPropagation()}
+                    on:click={() => dispatch("jobEdit", { id: item.id, duration: d })}
+                  >
+                    {d}s
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {/if}
 
           <div class="job-section">
             <span class="job-label">Provider</span>
@@ -602,6 +642,34 @@
             </div>
           </div>
 
+          {#if modelConfig?.hasEndFrame}
+            <div class="job-section">
+              <span class="job-label">End frame — drag an image tile here</span>
+              <div
+                class="end-frame-slot"
+                class:is-drop-target={dropTargetEndFrameId === item.id}
+                bind:this={endFrameSlotWrappers[item.id]}
+              >
+                {#if endFrameItem}
+                  <div class="ref-thumb">
+                    <img src={endFrameItem.dataUrl} alt="end frame" />
+                    {#if editable}
+                      <button
+                        class="ref-remove"
+                        on:pointerdown={(event) => event.stopPropagation()}
+                        on:click={() => dispatch("jobClearEndFrame", item.id)}
+                      >
+                        <XIcon size="10" />
+                      </button>
+                    {/if}
+                  </div>
+                {:else}
+                  <div class="ref-empty">no end frame yet</div>
+                {/if}
+              </div>
+            </div>
+          {/if}
+
           <div class="job-footer">
             {#if job.state === "pending" || job.state === "running"}
               <div class="job-banner">
@@ -630,9 +698,14 @@
                   class="job-result-thumb"
                   title="Open full size"
                   on:pointerdown={(event) => event.stopPropagation()}
-                  on:click={() => (lightboxSrc = outItem.dataUrl)}
+                  on:click={() => openLightbox(outItem.dataUrl, outItem.kind === "video")}
                 >
-                  <img src={outItem.dataUrl} alt="result" />
+                  {#if outItem.kind === "video"}
+                    <!-- svelte-ignore a11y-media-has-caption -->
+                    <video src={outItem.dataUrl} muted playsinline />
+                  {:else}
+                    <img src={outItem.dataUrl} alt="result" />
+                  {/if}
                 </button>
               {/if}
               <button
@@ -703,7 +776,7 @@
           class="lightbox-open"
           title="Open full size"
           on:pointerdown={(event) => event.stopPropagation()}
-          on:click={() => (lightboxSrc = streamSrcs[item.id] ?? item.dataUrl)}
+          on:click={() => openLightbox(streamSrcs[item.id] ?? item.dataUrl, item.kind === "video")}
         >
           <MaximizeIcon size="14" />
         </button>
@@ -777,18 +850,23 @@
   </div>
 {/each}
 
-<!-- dottodot parity: full-size image viewer. `fixed` (not part of the
+<!-- dottodot parity: full-size image/video viewer. `fixed` (not part of the
      pan/zoom fabric) so it always centers on the real viewport. -->
 {#if lightboxSrc}
   <div
     class="lightbox-backdrop"
     role="button"
     tabindex="0"
-    on:click={() => (lightboxSrc = null)}
-    on:keydown={(event) => event.key === "Escape" && (lightboxSrc = null)}
+    on:click={closeLightbox}
+    on:keydown={(event) => event.key === "Escape" && closeLightbox()}
   >
-    <img src={lightboxSrc} alt="full size preview" class="lightbox-img" />
-    <button class="lightbox-close" on:click={() => (lightboxSrc = null)}>
+    {#if lightboxIsVideo}
+      <!-- svelte-ignore a11y-media-has-caption -->
+      <video src={lightboxSrc} controls autoplay class="lightbox-img" />
+    {:else}
+      <img src={lightboxSrc} alt="full size preview" class="lightbox-img" />
+    {/if}
+    <button class="lightbox-close" on:click={closeLightbox}>
       <XIcon size="20" />
     </button>
   </div>
@@ -967,8 +1045,35 @@
     @apply block w-full max-h-24 rounded-md overflow-hidden ring-1 ring-zinc-700 flex-none;
   }
 
-  .job-result-thumb img {
+  .job-result-thumb img,
+  .job-result-thumb video {
     @apply w-full h-full object-cover;
+  }
+
+  /* Vision Round 3 — media-type toggle (image/video) in the job-node head. */
+  .media-type-toggle {
+    @apply flex gap-0.5 flex-none;
+  }
+
+  .media-type-btn {
+    @apply p-1 rounded bg-zinc-800 text-zinc-500 ring-1 ring-zinc-700;
+    @apply hover:text-zinc-300 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .media-type-btn.selected {
+    @apply bg-indigo-500/20 ring-indigo-500 text-indigo-200;
+  }
+
+  .job-negative-prompt {
+    @apply min-h-[44px] text-xs;
+  }
+
+  .end-frame-slot {
+    @apply flex items-center gap-1.5 min-h-[44px] p-1.5 rounded-md bg-zinc-800/50 border border-dashed border-zinc-700;
+  }
+
+  .end-frame-slot.is-drop-target {
+    @apply ring-2 ring-amber-400 border-amber-400;
   }
 
   .board-item img {
