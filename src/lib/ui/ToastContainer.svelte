@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { flip } from "svelte/animate";
   import { fly } from "svelte/transition";
-  import { Portal } from "@rgossiaux/svelte-headlessui";
+  import { portal } from "./portal";
 
   import Toast from "./Toast.svelte";
   import { toastStore } from "$lib/toast";
@@ -17,7 +17,7 @@
   });
 </script>
 
-<Portal>
+<div use:portal style="display: contents;">
   <div class="fixed inset-0 z-40 pointer-events-none flex justify-end p-4">
     <div class="w-full max-w-md">
       {#each $toastStore.slice().reverse() as toast (toast)}
@@ -39,4 +39,4 @@
       {/each}
     </div>
   </div>
-</Portal>
+</div>
