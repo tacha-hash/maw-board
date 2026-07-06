@@ -8,6 +8,8 @@
     LoaderIcon,
     CheckCircleIcon,
     AlertTriangleIcon,
+    MaximizeIcon,
+    PaperclipIcon,
   } from "svelte-feather-icons";
 
   import { slide } from "../action/slide";
@@ -43,14 +45,29 @@
   let guidesV: number[] = [];
   let guidesH: number[] = [];
 
+  // dottodot parity: full-size image viewer, opened from any image/video
+  // tile's 🔍 button or a job node's result thumbnail.
+  let lightboxSrc: string | null = null;
+
   const dispatch = createEventDispatcher<{
     move: { id: string; x: number; y: number };
     resize: { id: string; w: number; h: number };
     delete: string;
     edit: { id: string; text: string };
-    jobEdit: { id: string; prompt?: string; model?: string };
+    jobEdit: {
+      id: string;
+      prompt?: string;
+      model?: string;
+      aspect_ratio?: string;
+      resolution?: string;
+      provider?: string;
+    };
     jobGenerate: string;
     jobRetry: string;
+    /** A reference image (dragged from another board tile) was dropped onto this job node. */
+    jobAddImageRef: { id: string; imageItemId: string };
+    /** Remove one reference image by index. */
+    jobRemoveImageRef: { id: string; index: number };
   }>();
 
   // ── Image-gen job node — dataUrl is a JSON payload, not raw text (see
@@ -65,18 +82,37 @@
   // omitting it while the user is still typing would make the bridge start
   // generating on every keystroke.
   type JobState = "draft" | "pending" | "running" | "done" | "error";
+  // dottodot parity fields (PLAN.md, agreed 2026-07-06 ค่ำ) — additive, all
+  // optional on the wire, snake_case to match Kie's own API param names
+  // (runKieJob's body shape in board-bridge.ts) rather than camelCase.
   type JobPayload = {
     prompt: string;
     model: string;
+    aspect_ratio: string;
+    resolution: string;
+    provider: string;
+    input_image_ids: string[];
     state: JobState;
     error?: string;
   };
-  // First entry matches the bridge's own fallback default (runKieJob's `m`).
   // Must match board-bridge.ts's MODEL_ALIASES keys exactly (confirmed by
   // reading its source, commit 0f7f6d3) — anything else passes through to
   // Kie unaliased and 422s (found live: "seedream" alone isn't a valid Kie
   // model id, needs the "bytedance/seedream" the bridge maps it to).
-  const JOB_MODELS = ["nano-banana", "flux", "seedream", "gpt-image"];
+  const MODEL_BRANDS: { brand: string; models: string[] }[] = [
+    { brand: "Google", models: ["nano-banana"] },
+    { brand: "Black Forest Labs", models: ["flux"] },
+    { brand: "ByteDance", models: ["seedream"] },
+    { brand: "OpenAI", models: ["gpt-image"] },
+  ];
+  const JOB_MODELS = MODEL_BRANDS.flatMap((b) => b.models);
+  const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"];
+  const RESOLUTIONS = ["1K", "2K", "4K"];
+  // "fal"/"novita" show in the UI ahead of bridge support (Le: "เดี๋ยว bridge
+  // ผมตามรองรับ") — picking them is harmless today, bridge currently only
+  // implements "kie" and ignores the field entirely otherwise.
+  const PROVIDERS = ["kie", "fal", "novita"];
+
   function parseJob(dataUrl: string): JobPayload {
     try {
       const parsed = JSON.parse(dataUrl);
@@ -88,11 +124,25 @@
       return {
         prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
         model: typeof parsed.model === "string" ? parsed.model : JOB_MODELS[0],
+        aspect_ratio: typeof parsed.aspect_ratio === "string" ? parsed.aspect_ratio : ASPECT_RATIOS[0],
+        resolution: typeof parsed.resolution === "string" ? parsed.resolution : RESOLUTIONS[0],
+        provider: typeof parsed.provider === "string" ? parsed.provider : PROVIDERS[0],
+        input_image_ids: Array.isArray(parsed.input_image_ids)
+          ? parsed.input_image_ids.filter((x: unknown) => typeof x === "string")
+          : [],
         state,
         error: typeof parsed.error === "string" ? parsed.error : undefined,
       };
     } catch {
-      return { prompt: "", model: JOB_MODELS[0], state: "draft" };
+      return {
+        prompt: "",
+        model: JOB_MODELS[0],
+        aspect_ratio: ASPECT_RATIOS[0],
+        resolution: RESOLUTIONS[0],
+        provider: PROVIDERS[0],
+        input_image_ids: [],
+        state: "draft",
+      };
     }
   }
 
@@ -155,6 +205,64 @@
     window.removeEventListener("pointermove", onResize);
     window.removeEventListener("pointerup", endResize);
     window.removeEventListener("pointercancel", endResize);
+  }
+
+  // ── Image-reference drag (dottodot parity — "ลากรูปจากบอร์ดใส่ได้"): drag
+  // an image tile's 📎 handle onto a job node to attach it as an i2i
+  // reference. Both image tiles and job nodes render in this same
+  // `{#each items}` loop, so — unlike the link-port drag in Session.svelte,
+  // which had to coordinate across two components — this drag/drop-target
+  // detection lives entirely here. `jobTileWrappers` binds each job node's
+  // element for hit-testing (same technique termWrappers uses elsewhere).
+  const jobTileWrappers: Record<string, HTMLDivElement> = {};
+  let imageDragImageId: string | null = null;
+  let imageDragPointerId: number | null = null;
+  let dropTargetJobId: string | null = null;
+
+  function findJobUnderPoint(x: number, y: number): string | null {
+    for (const [id, el] of Object.entries(jobTileWrappers)) {
+      const r = el.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id;
+    }
+    return null;
+  }
+
+  function startImageDrag(event: PointerEvent, imageItemId: string) {
+    if (hasWriteAccess === false) return;
+    event.preventDefault();
+    event.stopPropagation();
+    imageDragImageId = imageItemId;
+    imageDragPointerId = event.pointerId ?? null;
+    window.addEventListener("pointermove", onImageDragMove);
+    window.addEventListener("pointerup", endImageDrag);
+    window.addEventListener("pointercancel", cancelImageDrag);
+  }
+
+  function onImageDragMove(event: PointerEvent) {
+    if (imageDragImageId === null || event.pointerId !== imageDragPointerId) return;
+    dropTargetJobId = findJobUnderPoint(event.clientX, event.clientY);
+  }
+
+  function endImageDrag(event: PointerEvent) {
+    if (imageDragImageId === null || event.pointerId !== imageDragPointerId) return;
+    const targetId = findJobUnderPoint(event.clientX, event.clientY);
+    if (targetId) {
+      dispatch("jobAddImageRef", { id: targetId, imageItemId: imageDragImageId });
+    }
+    cleanupImageDrag();
+  }
+
+  function cancelImageDrag() {
+    cleanupImageDrag();
+  }
+
+  function cleanupImageDrag() {
+    imageDragImageId = null;
+    imageDragPointerId = null;
+    dropTargetJobId = null;
+    window.removeEventListener("pointermove", onImageDragMove);
+    window.removeEventListener("pointerup", endImageDrag);
+    window.removeEventListener("pointercancel", cancelImageDrag);
   }
 
   // Drag state. While dragging, the dragged tile renders at `dragPos` and sends
@@ -345,6 +453,9 @@
     window.removeEventListener("pointermove", onResize);
     window.removeEventListener("pointerup", endResize);
     window.removeEventListener("pointercancel", endResize);
+    window.removeEventListener("pointermove", onImageDragMove);
+    window.removeEventListener("pointerup", endImageDrag);
+    window.removeEventListener("pointercancel", cancelImageDrag);
   });
 </script>
 
@@ -370,25 +481,37 @@
       {#if item.kind === "job"}
         {@const job = parseJob(item.dataUrl)}
         {@const editable = job.state === "draft"}
-        <div class="job-node" style:height="{item.h}px">
+        {@const outItem = job.state === "done" ? items.find((it) => it.id === `${item.id}-out`) : undefined}
+        <div
+          class="job-node"
+          style:height="{item.h}px"
+          class:is-drop-target={dropTargetJobId === item.id}
+          bind:this={jobTileWrappers[item.id]}
+        >
           <div class="job-head">
             <span class="job-title">🎨 Image Gen</span>
-            <select
-              class="job-model"
-              value={job.model}
-              disabled={hasWriteAccess === false || !editable}
-              on:pointerdown={(event) => event.stopPropagation()}
-              on:change={(event) =>
-                dispatch("jobEdit", {
-                  id: item.id,
-                  model: event.currentTarget.value,
-                })}
-            >
-              {#each JOB_MODELS as m}
-                <option value={m}>{m}</option>
-              {/each}
-            </select>
           </div>
+
+          <div class="job-section">
+            <span class="job-label">Model</span>
+            <div class="model-grid">
+              {#each MODEL_BRANDS as group}
+                {#each group.models as m}
+                  <button
+                    class="model-chip"
+                    class:selected={job.model === m}
+                    disabled={hasWriteAccess === false || !editable}
+                    on:pointerdown={(event) => event.stopPropagation()}
+                    on:click={() => dispatch("jobEdit", { id: item.id, model: m })}
+                  >
+                    <span class="model-name">{m}</span>
+                    <span class="model-brand">{group.brand}</span>
+                  </button>
+                {/each}
+              {/each}
+            </div>
+          </div>
+
           <textarea
             class="job-prompt"
             placeholder="Describe the image…"
@@ -401,6 +524,84 @@
                 prompt: event.currentTarget.value,
               })}
           />
+
+          <div class="job-section">
+            <span class="job-label">Aspect Ratio</span>
+            <div class="chip-row">
+              {#each ASPECT_RATIOS as ar}
+                <button
+                  class="chip"
+                  class:selected={job.aspect_ratio === ar}
+                  disabled={hasWriteAccess === false || !editable}
+                  on:pointerdown={(event) => event.stopPropagation()}
+                  on:click={() => dispatch("jobEdit", { id: item.id, aspect_ratio: ar })}
+                >
+                  {ar}
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <div class="job-section">
+            <span class="job-label">Resolution</span>
+            <div class="chip-row">
+              {#each RESOLUTIONS as res}
+                <button
+                  class="chip"
+                  class:selected={job.resolution === res}
+                  disabled={hasWriteAccess === false || !editable}
+                  on:pointerdown={(event) => event.stopPropagation()}
+                  on:click={() => dispatch("jobEdit", { id: item.id, resolution: res })}
+                >
+                  {res}
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <div class="job-section">
+            <span class="job-label">Provider</span>
+            <div class="chip-row">
+              {#each PROVIDERS as p}
+                <button
+                  class="chip"
+                  class:selected={job.provider === p}
+                  disabled={hasWriteAccess === false || !editable}
+                  on:pointerdown={(event) => event.stopPropagation()}
+                  on:click={() => dispatch("jobEdit", { id: item.id, provider: p })}
+                >
+                  {p}
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <div class="job-section">
+            <span class="job-label">Reference images ({job.input_image_ids.length}) — drag an image tile here for i2i</span>
+            <div class="ref-slots">
+              {#each job.input_image_ids as refId, i (refId + i)}
+                {@const refItem = items.find((it) => it.id === refId)}
+                {#if refItem}
+                  <div class="ref-thumb">
+                    <img src={refItem.dataUrl} alt="reference" />
+                    {#if editable}
+                      <button
+                        class="ref-remove"
+                        on:pointerdown={(event) => event.stopPropagation()}
+                        on:click={() => dispatch("jobRemoveImageRef", { id: item.id, index: i })}
+                      >
+                        <XIcon size="10" />
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              {/each}
+              {#if job.input_image_ids.length === 0}
+                <div class="ref-empty">no references yet</div>
+              {/if}
+            </div>
+          </div>
+
           <div class="job-footer">
             {#if job.state === "pending" || job.state === "running"}
               <div class="job-banner">
@@ -422,8 +623,18 @@
             {:else if job.state === "done"}
               <div class="job-banner job-banner-done">
                 <CheckCircleIcon size="14" />
-                <span>Done — see image on the board</span>
+                <span>Done</span>
               </div>
+              {#if outItem}
+                <button
+                  class="job-result-thumb"
+                  title="Open full size"
+                  on:pointerdown={(event) => event.stopPropagation()}
+                  on:click={() => (lightboxSrc = outItem.dataUrl)}
+                >
+                  <img src={outItem.dataUrl} alt="result" />
+                </button>
+              {/if}
               <button
                 class="job-btn"
                 on:pointerdown={(event) => event.stopPropagation()}
@@ -488,6 +699,26 @@
         >
           <DownloadIcon size="14" />
         </button>
+        <button
+          class="lightbox-open"
+          title="Open full size"
+          on:pointerdown={(event) => event.stopPropagation()}
+          on:click={() => (lightboxSrc = streamSrcs[item.id] ?? item.dataUrl)}
+        >
+          <MaximizeIcon size="14" />
+        </button>
+      {/if}
+
+      {#if item.kind === "image" && hasWriteAccess !== false}
+        <!-- dottodot parity: "ลากรูปจากบอร์ดใส่ได้" — drag this onto a job
+             node's reference-images section to use as an i2i input. -->
+        <button
+          class="ref-handle"
+          title="Drag onto a job node to use as an i2i reference"
+          on:pointerdown={(event) => startImageDrag(event, item.id)}
+        >
+          <PaperclipIcon size="12" />
+        </button>
       {/if}
 
       {#if hasWriteAccess !== false}
@@ -546,6 +777,23 @@
   </div>
 {/each}
 
+<!-- dottodot parity: full-size image viewer. `fixed` (not part of the
+     pan/zoom fabric) so it always centers on the real viewport. -->
+{#if lightboxSrc}
+  <div
+    class="lightbox-backdrop"
+    role="button"
+    tabindex="0"
+    on:click={() => (lightboxSrc = null)}
+    on:keydown={(event) => event.key === "Escape" && (lightboxSrc = null)}
+  >
+    <img src={lightboxSrc} alt="full size preview" class="lightbox-img" />
+    <button class="lightbox-close" on:click={() => (lightboxSrc = null)}>
+      <XIcon size="20" />
+    </button>
+  </div>
+{/if}
+
 <style lang="postcss">
   .board-item {
     @apply relative rounded-lg overflow-hidden bg-zinc-900 shadow-lg cursor-move select-none;
@@ -594,7 +842,7 @@
   }
 
   .job-node {
-    @apply flex flex-col gap-2 p-2.5 bg-zinc-900 cursor-default;
+    @apply flex flex-col gap-2.5 p-2.5 bg-zinc-900 cursor-default overflow-y-auto;
   }
 
   .job-head {
@@ -603,11 +851,6 @@
 
   .job-title {
     @apply text-xs font-semibold text-zinc-300;
-  }
-
-  .job-model {
-    @apply text-[11px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 outline-none;
-    @apply ring-1 ring-zinc-700 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed;
   }
 
   .job-prompt {
@@ -653,6 +896,81 @@
     @apply disabled:opacity-40 disabled:hover:bg-indigo-600 disabled:cursor-not-allowed;
   }
 
+  /* dottodot parity sections (model/aspect-ratio/resolution/provider/refs) */
+  .job-node.is-drop-target {
+    @apply ring-2 ring-amber-400;
+  }
+
+  .job-section {
+    @apply flex flex-col gap-1;
+  }
+
+  .job-label {
+    @apply text-[10px] uppercase tracking-wide text-zinc-500;
+  }
+
+  .model-grid {
+    @apply grid grid-cols-2 gap-1;
+  }
+
+  .model-chip {
+    @apply flex flex-col items-start px-2 py-1 rounded-md bg-zinc-800 ring-1 ring-zinc-700;
+    @apply hover:ring-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-left;
+  }
+
+  .model-chip.selected {
+    @apply bg-indigo-500/20 ring-indigo-500;
+  }
+
+  .model-name {
+    @apply text-xs text-zinc-100 leading-tight;
+  }
+
+  .model-brand {
+    @apply text-[9px] text-zinc-500 leading-tight;
+  }
+
+  .chip-row {
+    @apply flex flex-wrap gap-1;
+  }
+
+  .chip {
+    @apply text-[11px] px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300 ring-1 ring-zinc-700;
+    @apply hover:ring-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .chip.selected {
+    @apply bg-indigo-500/20 ring-indigo-500 text-indigo-200;
+  }
+
+  .ref-slots {
+    @apply flex flex-wrap gap-1.5 min-h-[44px] p-1.5 rounded-md bg-zinc-800/50 border border-dashed border-zinc-700;
+  }
+
+  .ref-thumb {
+    @apply relative w-10 h-10 rounded overflow-hidden ring-1 ring-zinc-700;
+  }
+
+  .ref-thumb img {
+    @apply w-full h-full object-cover;
+  }
+
+  .ref-remove {
+    @apply absolute top-0 right-0 p-0.5 bg-black/60 text-white rounded-bl;
+  }
+
+  .ref-empty {
+    @apply flex items-center text-[11px] text-zinc-600 px-1;
+  }
+
+  .job-result-thumb {
+    @apply block w-full max-h-24 rounded-md overflow-hidden ring-1 ring-zinc-700 flex-none;
+  }
+
+  .job-result-thumb img {
+    @apply w-full h-full object-cover;
+  }
+
   .board-item img {
     @apply block w-full h-auto pointer-events-none;
   }
@@ -680,6 +998,16 @@
     @apply opacity-0 transition-opacity hover:bg-indigo-600 hover:text-white;
   }
 
+  .lightbox-open {
+    @apply absolute bottom-1 left-8 p-0.5 rounded bg-zinc-800/80 text-zinc-300 z-30;
+    @apply opacity-0 transition-opacity hover:bg-indigo-600 hover:text-white;
+  }
+
+  .ref-handle {
+    @apply absolute bottom-1 left-[60px] p-0.5 rounded bg-zinc-800/80 text-zinc-300 z-30;
+    @apply opacity-0 transition-opacity hover:bg-amber-600 hover:text-white cursor-grab touch-none;
+  }
+
   .drag-grip {
     @apply absolute top-1 left-1 z-20 rounded bg-zinc-800/80 text-zinc-300;
     @apply px-1.5 py-0.5 text-xs leading-none cursor-move touch-none select-none;
@@ -690,7 +1018,9 @@
     @apply opacity-100;
   }
 
-  .board-item:hover .download {
+  .board-item:hover .download,
+  .board-item:hover .lightbox-open,
+  .board-item:hover .ref-handle {
     @apply opacity-100;
   }
 
@@ -716,6 +1046,8 @@
   @media (hover: none), (pointer: coarse) {
     .delete,
     .download,
+    .lightbox-open,
+    .ref-handle,
     .drag-grip {
       @apply opacity-100 p-1.5;
     }
@@ -725,5 +1057,17 @@
     .drag-grip {
       @apply min-w-[44px] min-h-[44px] grid place-items-center text-base;
     }
+  }
+
+  .lightbox-backdrop {
+    @apply fixed inset-0 z-[100] flex items-center justify-center bg-black/85 p-8;
+  }
+
+  .lightbox-img {
+    @apply max-w-full max-h-full rounded-lg shadow-2xl;
+  }
+
+  .lightbox-close {
+    @apply absolute top-4 right-4 p-2 rounded-full bg-zinc-800/80 text-zinc-200 hover:bg-red-600 hover:text-white;
   }
 </style>

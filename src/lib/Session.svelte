@@ -1186,8 +1186,16 @@
       x,
       y,
       w: 300,
-      h: 320,
-      dataUrl: JSON.stringify({ prompt: "", model: "nano-banana", state: "draft" }),
+      h: 560,
+      dataUrl: JSON.stringify({
+        prompt: "",
+        model: "nano-banana",
+        aspect_ratio: "1:1",
+        resolution: "1K",
+        provider: "kie",
+        input_image_ids: [],
+        state: "draft",
+      }),
     };
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
@@ -1199,9 +1207,16 @@
   // processable (its guard is `payload.state && payload.state !== "pending"`)
   // — so a draft MUST carry an explicit `state: "draft"`, never omit it,
   // or the bridge starts generating on the very first keystroke.
+  // aspect_ratio/resolution/provider/input_image_ids are dottodot-parity
+  // fields (PLAN.md, additive, snake_case to match Kie's own param names) —
+  // all optional on the wire, defaulted here.
   function parseJobPayload(dataUrl: string): {
     prompt: string;
     model: string;
+    aspect_ratio: string;
+    resolution: string;
+    provider: string;
+    input_image_ids: string[];
     state: "draft" | "pending" | "running" | "done" | "error";
     error?: string;
   } {
@@ -1213,23 +1228,74 @@
       return {
         prompt: typeof p.prompt === "string" ? p.prompt : "",
         model: typeof p.model === "string" ? p.model : "nano-banana",
+        aspect_ratio: typeof p.aspect_ratio === "string" ? p.aspect_ratio : "1:1",
+        resolution: typeof p.resolution === "string" ? p.resolution : "1K",
+        provider: typeof p.provider === "string" ? p.provider : "kie",
+        input_image_ids: Array.isArray(p.input_image_ids)
+          ? p.input_image_ids.filter((x: unknown) => typeof x === "string")
+          : [],
         state,
         error: typeof p.error === "string" ? p.error : undefined,
       };
     } catch {
-      return { prompt: "", model: "nano-banana", state: "draft" };
+      return {
+        prompt: "",
+        model: "nano-banana",
+        aspect_ratio: "1:1",
+        resolution: "1K",
+        provider: "kie",
+        input_image_ids: [],
+        state: "draft",
+      };
     }
   }
 
-  // Prompt/model edits from the JobNode UI — only while still a draft, so a
-  // stray keystroke can't fight the bridge mid-generation.
-  function handleJobEdit(id: string, patch: { prompt?: string; model?: string }) {
+  // Prompt/model/aspect-ratio/resolution/provider edits from the JobNode UI
+  // — only while still a draft, so a stray keystroke can't fight the bridge
+  // mid-generation.
+  function handleJobEdit(
+    id: string,
+    patch: {
+      prompt?: string;
+      model?: string;
+      aspect_ratio?: string;
+      resolution?: string;
+      provider?: string;
+    },
+  ) {
     if (!canEdit) return;
     const item = boardItems.find((it) => it.id === id);
     if (!item) return;
     const job = parseJobPayload(item.dataUrl);
     if (job.state !== "draft") return;
     const updated = { ...item, dataUrl: JSON.stringify({ ...job, ...patch }) };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  // dottodot parity: attach/detach an i2i reference image (dragged from
+  // another board tile onto this job node's reference-images section).
+  function handleJobAddImageRef(id: string, imageItemId: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    if (job.state !== "draft" || job.input_image_ids.includes(imageItemId)) return;
+    const updated = {
+      ...item,
+      dataUrl: JSON.stringify({ ...job, input_image_ids: [...job.input_image_ids, imageItemId] }),
+    };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  function handleJobRemoveImageRef(id: string, index: number) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    const input_image_ids = job.input_image_ids.filter((_, i) => i !== index);
+    const updated = { ...item, dataUrl: JSON.stringify({ ...job, input_image_ids }) };
     upsertBoardItem(updated);
     srocket?.send({ boardPut: updated });
   }
@@ -2686,6 +2752,8 @@
       on:jobEdit={({ detail }) => handleJobEdit(detail.id, detail)}
       on:jobGenerate={({ detail }) => handleJobGenerate(detail)}
       on:jobRetry={({ detail }) => handleJobRetry(detail)}
+      on:jobAddImageRef={({ detail }) => handleJobAddImageRef(detail.id, detail.imageItemId)}
+      on:jobRemoveImageRef={({ detail }) => handleJobRemoveImageRef(detail.id, detail.index)}
     />
 
     {#if contextMenu}
