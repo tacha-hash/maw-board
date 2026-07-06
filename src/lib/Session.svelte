@@ -2976,7 +2976,7 @@
       {#if link}
         {@const shellA = shells.find(([sid]) => sid === link.a)}
         {@const shellB = shells.find(([sid]) => sid === link.b)}
-        {#if shellA && shellB}
+        {#if shellA && shellB && termWrappers[link.a]?.offsetWidth && termWrappers[link.b]?.offsetWidth}
           {@const wsA = link.a === moving ? movingSize : shellA[1]}
           {@const wsB = link.b === moving ? movingSize : shellB[1]}
           {@const elA = termWrappers[link.a]}
@@ -2995,6 +2995,12 @@
           {@const lineH = Math.max(Math.abs(pointBy - pointAy), 1)}
           {@const thisLinkId = linkId(link.a, link.b)}
           {@const isHovered = hoveredLinkId === thisLinkId}
+          {@const bx1 = pointAx <= pointBx ? 0 : lineW}
+          {@const by1 = pointAy <= pointBy ? 0 : lineH}
+          {@const bx2 = pointAx <= pointBx ? lineW : 0}
+          {@const by2 = pointAy <= pointBy ? lineH : 0}
+          {@const bdx = Math.max(48, Math.abs(bx2 - bx1) / 2)}
+          {@const bezier = `M ${bx1} ${by1} C ${bx1 + (bx1 <= bx2 ? bdx : -bdx)} ${by1}, ${bx2 + (bx1 <= bx2 ? -bdx : bdx)} ${by2}, ${bx2} ${by2}`}
           <div
             class="absolute pointer-events-none"
             style:left={OFFSET_LEFT_CSS}
@@ -3010,11 +3016,12 @@
                    wide, invisible, `pointer-events: stroke` companion line
                    makes the thin visible line easy to actually hover (3px
                    is too thin to reliably point at otherwise). -->
-              <line
-                x1={pointAx <= pointBx ? 0 : lineW}
-                y1={pointAy <= pointBy ? 0 : lineH}
-                x2={pointAx <= pointBx ? lineW : 0}
-                y2={pointAy <= pointBy ? lineH : 0}
+              <!-- dottodot/xyflow-style smooth bezier: control points pushed
+                   horizontally from each endpoint so the curve leaves the
+                   node sideways like a port wire, not a taut string. -->
+              <path
+                d={bezier}
+                fill="none"
                 stroke="transparent"
                 stroke-width="16"
                 pointer-events="stroke"
@@ -3022,15 +3029,13 @@
                 on:pointerenter={() => (hoveredLinkId = thisLinkId)}
                 on:pointerleave={() => (hoveredLinkId = null)}
               />
-              <line
-                x1={pointAx <= pointBx ? 0 : lineW}
-                y1={pointAy <= pointBy ? 0 : lineH}
-                x2={pointAx <= pointBx ? lineW : 0}
-                y2={pointAy <= pointBy ? lineH : 0}
+              <path
+                d={bezier}
+                fill="none"
                 stroke="#818cf8"
                 stroke-width={isHovered ? 4 : 2.5}
                 stroke-dasharray="8 6"
-                opacity={isHovered ? 1 : 0.35}
+                opacity={isHovered ? 1 : 0.55}
                 pointer-events="none"
                 style="transition: opacity 120ms, stroke-width 120ms;"
               />
