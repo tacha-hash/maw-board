@@ -14,6 +14,11 @@
   // Names currently mirrored on the board (matched against terminal labels
   // by Session.svelte) — toggles each row between View/Interact and Remove.
   export let onBoard: Set<string> = new Set();
+  // Session.svelte measures the online-users NameList's real height (it
+  // sits right above this panel in the same left column) and passes the
+  // pixel offset to start below it — a fixed CSS top overlapped it
+  // whenever enough people were connected (Louis hit this live).
+  export let topPx = 80;
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -41,7 +46,7 @@
   }
 </script>
 
-<div class="roster panel">
+<div class="roster panel" style:top="{topPx}px">
   <div class="head">
     <div class="flex items-center gap-1.5 text-zinc-200 font-medium text-sm">
       <UsersIcon size="15" />
@@ -126,10 +131,12 @@
 <style lang="postcss">
   /* top-36 (not top-20, like FileExplorer) — the "online users" NameList
      (Session.svelte, `fixed left-3 top-24`) occupies the same top-left
-     corner and Roster defaults open (unlike FileExplorer), so it collides
-     with NameList's rows unless pushed down past its typical height. */
+     corner and Roster defaults open (unlike FileExplorer) — `top` comes in
+     as `topPx` (measured live from NameList's actual height) rather than a
+     fixed class, since a fixed guess overlapped it once enough people were
+     connected to make NameList taller than expected. */
   .roster {
-    @apply fixed left-2 right-2 sm:right-auto sm:left-4 top-36 bottom-4 w-auto sm:w-72 z-30 flex flex-col p-0 overflow-hidden;
+    @apply fixed left-2 right-2 sm:right-auto sm:left-4 bottom-4 w-auto sm:w-72 z-30 flex flex-col p-0 overflow-hidden;
   }
   .head {
     @apply flex items-center justify-between px-3 py-2 border-b border-zinc-700/60;

@@ -110,6 +110,26 @@
   // primary left nav per PLAN.md's round-2 spec, not an on-demand tool.
   let showRoster = true; // @hmr:keep
 
+  // The online-users NameList (below) sits directly above Roster in the same
+  // left column — a fixed offset (what round-2 shipped with) overlapped it
+  // whenever enough people were connected to grow NameList taller than
+  // guessed (Louis hit this live with bridge+several humans connected).
+  // ResizeObserver tracks its REAL height so Roster always starts right
+  // below it, however many users are on the board at any moment.
+  let nameListWrapper: HTMLDivElement | undefined;
+  let nameListHeight = 0;
+  let nameListObserver: ResizeObserver | undefined;
+  $: if (nameListWrapper) {
+    nameListObserver?.disconnect();
+    nameListObserver = new ResizeObserver((entries) => {
+      nameListHeight = entries[0]?.contentRect.height ?? 0;
+    });
+    nameListObserver.observe(nameListWrapper);
+  }
+  // NameList itself sits at `top-24` (96px); when it's not shown at all
+  // (no other users), fall back to FileExplorer's smaller top-20 (80px).
+  $: rosterTopPx = users.length > 0 ? 96 + nameListHeight + 16 : 80;
+
   // Auto-hiding toolbar (Apple menu-bar style): fades out after inactivity,
   // reveals when the pointer nears the top edge or hovers it.
   let toolbarVisible = true;
@@ -277,6 +297,11 @@
     const [lo, hi] = a < b ? [a, b] : [b, a];
     return `link:${lo}:${hi}`;
   }
+
+  // Dim-by-default, brighten-on-hover for link lines (Louis: a straight
+  // line cutting across the whole board reads as clutter when it crosses
+  // other nodes — see the render block for the actual visual treatment).
+  let hoveredLinkId: string | null = null;
 
   /** Create (or idempotently re-put) a link between two shells. */
   function createLink(a: number, b: number) {
@@ -1270,14 +1295,19 @@
   })();
 
   // "Add to board" / "New agent" only ever post a request — spawning the
-  // actual mirror/terminal is the bridge's job (Le — board-bridge.ts).
-  function postAgentRequest(payload: Record<string, unknown>) {
+  // actual mirror/terminal is the bridge's job (Le — board-bridge.ts). `pos`
+  // becomes the item's own x/y (not something inside the JSON payload) —
+  // board-bridge.ts reads `msg.boardPut.x`/`.y` directly to place the new
+  // shell (confirmed from its source), so passing a real position here is
+  // enough on its own; no bridge-side change needed.
+  function postAgentRequest(payload: Record<string, unknown>, pos?: [number, number]) {
     if (!canEdit) return;
+    const [x, y] = pos ?? [0, 0];
     const item: BoardItem = {
       id: `agent-request:${crypto.randomUUID()}`,
       kind: "agent-request",
-      x: 0,
-      y: 0,
+      x,
+      y,
       w: 0,
       h: 0,
       dataUrl: JSON.stringify(payload),
@@ -1295,13 +1325,27 @@
   // reaches the real agent's terminal). "remove" posts no board item at
   // all — one would get silently (mis)treated as another add attempt.
   function handleAddAgentToBoard(name: string, mode: "view" | "interact") {
-    postAgentRequest({
-      action: "add",
-      agent: name,
-      mode,
-      requestedBy: $settings.name || "someone",
-      ts: Date.now(),
-    });
+    // Same collision-avoiding spiral placement handleCreate uses for "+ New
+    // Terminal" — without this every agent landed at bridge's hardcoded
+    // (300,300) fallback and stacked directly on top of each other (Louis's
+    // tidy-pass feedback: "ปรับ default placement... หา slot ว่าง").
+    const existing = shells.map(([id, winsize]) => ({
+      x: winsize.x,
+      y: winsize.y,
+      width: termWrappers[id]?.clientWidth ?? 752,
+      height: termWrappers[id]?.clientHeight ?? 515,
+    }));
+    const { x, y } = arrangeNewTerminal(existing);
+    postAgentRequest(
+      {
+        action: "add",
+        agent: name,
+        mode,
+        requestedBy: $settings.name || "someone",
+        ts: Date.now(),
+      },
+      [x, y],
+    );
     queuePendingAgentLabel(name, mode);
     makeToast({
       kind: "success",
@@ -2507,6 +2551,7 @@
     <RosterSidebar
       agents={roster.agents}
       onBoard={mirroredAgents}
+      topPx={rosterTopPx}
       {canEdit}
       on:close={() => (showRoster = false)}
       on:addAgent={({ detail }) => handleAddAgentToBoard(detail.name, detail.mode)}
@@ -2606,7 +2651,10 @@
 
   <!-- Online users — vertical column down the left edge. -->
   {#if users.length > 0}
-    <div class="fixed left-3 top-24 z-30 max-h-[70vh] overflow-y-auto pointer-events-auto">
+    <div
+      class="fixed left-3 top-24 z-30 max-h-[70vh] overflow-y-auto pointer-events-auto"
+      bind:this={nameListWrapper}
+    >
       <NameList {users} vertical />
     </div>
   {/if}
@@ -2810,6 +2858,8 @@
           {@const anchorY = Math.min(centerAy, centerBy)}
           {@const lineW = Math.max(Math.abs(centerBx - centerAx), 1)}
           {@const lineH = Math.max(Math.abs(centerBy - centerAy), 1)}
+          {@const thisLinkId = linkId(link.a, link.b)}
+          {@const isHovered = hoveredLinkId === thisLinkId}
           <div
             class="absolute pointer-events-none"
             style:left={OFFSET_LEFT_CSS}
@@ -2818,14 +2868,36 @@
             use:slide={{ x: anchorX, y: anchorY, center, zoom, immediate: true }}
           >
             <svg width={lineW} height={lineH} style="overflow: visible;">
+              <!-- Dimmed by default (Louis: a straight line cutting across
+                   the whole board reads as visual noise when it crosses
+                   other nodes) — brightens on hover so it's easy to trace
+                   deliberately without cluttering the default view. A
+                   wide, invisible, `pointer-events: stroke` companion line
+                   makes the thin visible line easy to actually hover (3px
+                   is too thin to reliably point at otherwise). -->
+              <line
+                x1={centerAx <= centerBx ? 0 : lineW}
+                y1={centerAy <= centerBy ? 0 : lineH}
+                x2={centerAx <= centerBx ? lineW : 0}
+                y2={centerAy <= centerBy ? lineH : 0}
+                stroke="transparent"
+                stroke-width="16"
+                pointer-events="stroke"
+                style="cursor: pointer;"
+                on:pointerenter={() => (hoveredLinkId = thisLinkId)}
+                on:pointerleave={() => (hoveredLinkId = null)}
+              />
               <line
                 x1={centerAx <= centerBx ? 0 : lineW}
                 y1={centerAy <= centerBy ? 0 : lineH}
                 x2={centerAx <= centerBx ? lineW : 0}
                 y2={centerAy <= centerBy ? lineH : 0}
                 stroke="#818cf8"
-                stroke-width="3"
+                stroke-width={isHovered ? 4 : 2.5}
                 stroke-dasharray="8 6"
+                opacity={isHovered ? 1 : 0.35}
+                pointer-events="none"
+                style="transition: opacity 120ms, stroke-width 120ms;"
               />
             </svg>
             {#if canEdit}
