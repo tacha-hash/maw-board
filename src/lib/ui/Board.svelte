@@ -1,7 +1,14 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy } from "svelte";
   import { fade } from "svelte/transition";
-  import { XIcon, DownloadIcon } from "svelte-feather-icons";
+  import {
+    XIcon,
+    DownloadIcon,
+    ZapIcon,
+    LoaderIcon,
+    CheckCircleIcon,
+    AlertTriangleIcon,
+  } from "svelte-feather-icons";
 
   import { slide } from "../action/slide";
   import { computeSnap, type SnapRect } from "../snap";
@@ -395,14 +402,16 @@
               })}
           />
           <div class="job-footer">
-            {#if job.state === "pending"}
-              <span class="job-status">⏳ Queued — waiting for bridge…</span>
-            {:else if job.state === "running"}
-              <span class="job-status">🎨 Generating…</span>
+            {#if job.state === "pending" || job.state === "running"}
+              <div class="job-banner">
+                <LoaderIcon size="14" class="spin" />
+                <span>{job.state === "pending" ? "Queued — waiting for bridge…" : "Generating…"}</span>
+              </div>
             {:else if job.state === "error"}
-              <span class="job-status job-status-error"
-                >⚠ {job.error ?? "Generation failed"}</span
-              >
+              <div class="job-banner job-banner-error">
+                <AlertTriangleIcon size="14" />
+                <span>{job.error ?? "Generation failed"}</span>
+              </div>
               <button
                 class="job-btn"
                 on:pointerdown={(event) => event.stopPropagation()}
@@ -411,7 +420,10 @@
                 Retry
               </button>
             {:else if job.state === "done"}
-              <span class="job-status">✅ Done — see image on the board</span>
+              <div class="job-banner job-banner-done">
+                <CheckCircleIcon size="14" />
+                <span>Done — see image on the board</span>
+              </div>
               <button
                 class="job-btn"
                 on:pointerdown={(event) => event.stopPropagation()}
@@ -426,7 +438,8 @@
                 on:pointerdown={(event) => event.stopPropagation()}
                 on:click={() => dispatch("jobGenerate", item.id)}
               >
-                ▶ Generate
+                <ZapIcon size="14" />
+                <span>Generate</span>
               </button>
             {/if}
           </div>
@@ -608,20 +621,35 @@
     @apply flex items-center gap-2 min-h-[28px];
   }
 
-  .job-status {
-    @apply text-xs text-zinc-400 flex-1 truncate;
+  /* Pill-style status banner (dottodot's JobStatusBanner pattern) — icon +
+     text in a tinted, bordered chip instead of a bare status line. */
+  .job-banner {
+    @apply flex items-center gap-1.5 flex-1 min-w-0 px-2 py-1 rounded-md text-xs;
+    @apply text-indigo-300 bg-indigo-500/10 ring-1 ring-indigo-500/30;
   }
 
-  .job-status-error {
-    @apply text-red-400;
+  .job-banner span {
+    @apply truncate;
+  }
+
+  .job-banner-error {
+    @apply text-red-300 bg-red-500/10 ring-red-500/30;
+  }
+
+  .job-banner-done {
+    @apply text-emerald-300 bg-emerald-500/10 ring-emerald-500/30;
+  }
+
+  :global(.job-banner .spin) {
+    @apply animate-spin flex-none;
   }
 
   .job-btn {
-    @apply text-xs px-2.5 py-1 rounded-md bg-zinc-700/80 text-zinc-200 hover:bg-zinc-600;
+    @apply text-xs px-2.5 py-1 rounded-md bg-zinc-700/80 text-zinc-200 hover:bg-zinc-600 flex-none;
   }
 
   .job-btn-primary {
-    @apply bg-indigo-600 text-white hover:bg-indigo-500 ml-auto;
+    @apply flex items-center justify-center gap-1.5 bg-indigo-600 text-white hover:bg-indigo-500 ml-auto;
     @apply disabled:opacity-40 disabled:hover:bg-indigo-600 disabled:cursor-not-allowed;
   }
 
