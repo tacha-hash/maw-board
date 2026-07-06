@@ -17,28 +17,13 @@
     KeyIcon,
   } from "svelte-feather-icons";
   import { makeToast } from "$lib/toast";
+  import { keyFor, saveKey } from "$lib/boardKeys";
 
   type BoardInfo = { name: string; live: boolean; modified: number | null; size: number | null };
 
   let boards: BoardInfo[] = [];
   let loading = true;
   let loadError = "";
-
-  const KEY_STORAGE = "oracle-board-keys";
-
-  function loadKeyMap(): Record<string, string> {
-    try {
-      return JSON.parse(localStorage.getItem(KEY_STORAGE) ?? "{}");
-    } catch {
-      return {};
-    }
-  }
-
-  function saveKey(name: string, key: string) {
-    const map = loadKeyMap();
-    map[name] = key;
-    localStorage.setItem(KEY_STORAGE, JSON.stringify(map));
-  }
 
   async function loadBoards() {
     loading = true;
@@ -82,10 +67,6 @@
   // paste — see docs/lobby-ui-design.md.
   let pendingOpenName: string | null = null;
   let manualKeyInput = "";
-
-  function keyFor(name: string): string | undefined {
-    return loadKeyMap()[name];
-  }
 
   function openWithKey(name: string, key: string) {
     window.location.href = `${window.location.origin}/s/${name}#${key}`;

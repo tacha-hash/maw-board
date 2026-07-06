@@ -28,6 +28,7 @@
   } from "./board";
   import { RtcMesh } from "./rtc";
   import { makeToast } from "./toast";
+  import { saveKey, removeKey } from "./boardKeys";
   import {
     computeSnap,
     computeSnapTarget,
@@ -303,6 +304,26 @@
   // other nodes — see the render block for the actual visual treatment).
   let hoveredLinkId: string | null = null;
 
+  /** Point where the ray from (cx,cy) toward (cx+dx, cy+dy) exits a
+   *  halfW/halfH box centered at (cx,cy) — anchors link lines at each
+   *  node's edge instead of drawing straight through its center. Bug found
+   *  live (Louis, 2026-07-06 ค่ำ): center-to-center lines passed through
+   *  both terminals with no visible connection point at either end. */
+  function clipToBoxEdge(
+    cx: number,
+    cy: number,
+    halfW: number,
+    halfH: number,
+    dx: number,
+    dy: number,
+  ): [number, number] {
+    if (dx === 0 && dy === 0) return [cx, cy];
+    const tx = dx !== 0 ? halfW / Math.abs(dx) : Infinity;
+    const ty = dy !== 0 ? halfH / Math.abs(dy) : Infinity;
+    const t = Math.min(tx, ty);
+    return [cx + t * dx, cy + t * dy];
+  }
+
   /** Create (or idempotently re-put) a link between two shells. */
   function createLink(a: number, b: number) {
     if (!canEdit || a === b) return;
@@ -485,6 +506,7 @@
         } else if (message.invalidAuth) {
           exitReason =
             "The URL is not correct, invalid end-to-end encryption key.";
+          removeKey(id); // undo onConnect's optimistic save — this key doesn't work
           srocket?.dispose();
         } else if (message.chunks) {
           let [id, seqnum, chunks] = message.chunks;
@@ -588,6 +610,14 @@
           srocket?.send({ setName: $settings.name });
         }
         connected = true;
+        // Bug found live (Louis, 2026-07-06 ค่ำ): the lobby's "Open" button
+        // kept saying "Need key" for boards you clearly had the key for —
+        // only the lobby's own New Board flow ever wrote to the shared key
+        // map, opening a board via a full URL never did. Save optimistically
+        // here (rolled back on invalidAuth below) rather than waiting for
+        // some "auth definitely succeeded" signal that doesn't really exist
+        // in the protocol beyond "invalidAuth didn't arrive".
+        saveKey(id, key);
       },
 
       onDisconnect() {
@@ -2955,10 +2985,14 @@
           {@const centerAy = wsA.y + (elA?.offsetHeight ?? 0) / 2}
           {@const centerBx = wsB.x + (elB?.offsetWidth ?? 0) / 2}
           {@const centerBy = wsB.y + (elB?.offsetHeight ?? 0) / 2}
-          {@const anchorX = Math.min(centerAx, centerBx)}
-          {@const anchorY = Math.min(centerAy, centerBy)}
-          {@const lineW = Math.max(Math.abs(centerBx - centerAx), 1)}
-          {@const lineH = Math.max(Math.abs(centerBy - centerAy), 1)}
+          {@const edgeA = clipToBoxEdge(centerAx, centerAy, (elA?.offsetWidth ?? 0) / 2, (elA?.offsetHeight ?? 0) / 2, centerBx - centerAx, centerBy - centerAy)}
+          {@const edgeB = clipToBoxEdge(centerBx, centerBy, (elB?.offsetWidth ?? 0) / 2, (elB?.offsetHeight ?? 0) / 2, centerAx - centerBx, centerAy - centerBy)}
+          {@const [pointAx, pointAy] = edgeA}
+          {@const [pointBx, pointBy] = edgeB}
+          {@const anchorX = Math.min(pointAx, pointBx)}
+          {@const anchorY = Math.min(pointAy, pointBy)}
+          {@const lineW = Math.max(Math.abs(pointBx - pointAx), 1)}
+          {@const lineH = Math.max(Math.abs(pointBy - pointAy), 1)}
           {@const thisLinkId = linkId(link.a, link.b)}
           {@const isHovered = hoveredLinkId === thisLinkId}
           <div
@@ -2977,10 +3011,10 @@
                    makes the thin visible line easy to actually hover (3px
                    is too thin to reliably point at otherwise). -->
               <line
-                x1={centerAx <= centerBx ? 0 : lineW}
-                y1={centerAy <= centerBy ? 0 : lineH}
-                x2={centerAx <= centerBx ? lineW : 0}
-                y2={centerAy <= centerBy ? lineH : 0}
+                x1={pointAx <= pointBx ? 0 : lineW}
+                y1={pointAy <= pointBy ? 0 : lineH}
+                x2={pointAx <= pointBx ? lineW : 0}
+                y2={pointAy <= pointBy ? lineH : 0}
                 stroke="transparent"
                 stroke-width="16"
                 pointer-events="stroke"
@@ -2989,10 +3023,10 @@
                 on:pointerleave={() => (hoveredLinkId = null)}
               />
               <line
-                x1={centerAx <= centerBx ? 0 : lineW}
-                y1={centerAy <= centerBy ? 0 : lineH}
-                x2={centerAx <= centerBx ? lineW : 0}
-                y2={centerAy <= centerBy ? lineH : 0}
+                x1={pointAx <= pointBx ? 0 : lineW}
+                y1={pointAy <= pointBy ? 0 : lineH}
+                x2={pointAx <= pointBx ? lineW : 0}
+                y2={pointAy <= pointBy ? lineH : 0}
                 stroke="#818cf8"
                 stroke-width={isHovered ? 4 : 2.5}
                 stroke-dasharray="8 6"
@@ -3026,10 +3060,12 @@
       {#if fromShell}
         {@const fromWs = drawing.fromId === moving ? movingSize : fromShell[1]}
         {@const fromEl = termWrappers[drawing.fromId]}
-        {@const fromX = fromWs.x + (fromEl?.offsetWidth ?? 0) / 2}
-        {@const fromY = fromWs.y + (fromEl?.offsetHeight ?? 0) / 2}
+        {@const fromCenterX = fromWs.x + (fromEl?.offsetWidth ?? 0) / 2}
+        {@const fromCenterY = fromWs.y + (fromEl?.offsetHeight ?? 0) / 2}
         {@const toX = drawing.toWorld[0]}
         {@const toY = drawing.toWorld[1]}
+        {@const fromEdge = clipToBoxEdge(fromCenterX, fromCenterY, (fromEl?.offsetWidth ?? 0) / 2, (fromEl?.offsetHeight ?? 0) / 2, toX - fromCenterX, toY - fromCenterY)}
+        {@const [fromX, fromY] = fromEdge}
         {@const previewAnchorX = Math.min(fromX, toX)}
         {@const previewAnchorY = Math.min(fromY, toY)}
         {@const previewW = Math.max(Math.abs(toX - fromX), 1)}
