@@ -201,7 +201,7 @@ fn backend_token(mac: impl Mac, name: &str, backend_id: BackendId) -> String {
 /// presented by any backend calling `Join()`. Uses the same server-wide MAC
 /// secret as reconnect tokens, with a distinct domain-separation suffix, so
 /// no additional per-session secret needs to be stored.
-fn join_token(mac: impl Mac, name: &str) -> String {
+pub(crate) fn join_token(mac: impl Mac, name: &str) -> String {
     let mac = mac.chain_update(name).chain_update(b"join");
     BASE64_STANDARD.encode(mac.finalize().into_bytes())
 }

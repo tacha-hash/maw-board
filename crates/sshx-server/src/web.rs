@@ -161,7 +161,10 @@ async fn new_board(
             let _ = disk.save(&name, &snapshot);
         }
     }
-    axum::Json(serde_json::json!({ "name": name, "key": key })).into_response()
+    // join_token ให้ backend (agent host) เข้ามา Join บอร์ดนี้ทีหลังได้ —
+    // mint จาก server-wide mac แบบเดียวกับ Open() (tailnet-only จึงยอมรับได้ระดับนี้)
+    let jt = crate::grpc::join_token(state.mac(), &name);
+    axum::Json(serde_json::json!({ "name": name, "key": key, "join_token": jt })).into_response()
 }
 
 /// Lobby listing: persisted boards (disk) merged with live in-memory sessions.
