@@ -1342,7 +1342,10 @@
   // string[] of names (see fleetRoster() in board-bridge.ts), so normalize
   // each entry to {name} for RosterSidebar; tolerate an object shape too in
   // case a future bridge version enriches it, per the same defensive-parse
-  // pattern as every other JSON-payload board item.
+  // pattern as every other JSON-payload board item. `status` (additive,
+  // per Le 2026-07-06 ค่ำ) is a name->"live"|"sleeping" map, not part of
+  // each agent entry itself — merged in here so RosterSidebar just reads
+  // agent.status directly.
   const ROSTER_ID = "roster";
   $: rosterItem = boardItems.find((it) => it.id === ROSTER_ID);
   $: roster = ((): { agents: { name: string; host?: string; status?: string }[] } => {
@@ -1350,10 +1353,13 @@
       if (!rosterItem?.dataUrl) return { agents: [] };
       const parsed = JSON.parse(rosterItem.dataUrl);
       const list = Array.isArray(parsed.agents) ? parsed.agents : [];
+      const statusMap: Record<string, string> =
+        parsed.status && typeof parsed.status === "object" ? parsed.status : {};
       return {
-        agents: list.map((a: unknown) =>
-          typeof a === "string" ? { name: a } : (a as { name: string }),
-        ),
+        agents: list.map((a: unknown) => {
+          const agent = typeof a === "string" ? { name: a } : (a as { name: string; status?: string });
+          return { ...agent, status: statusMap[agent.name] ?? agent.status };
+        }),
       };
     } catch {
       return { agents: [] };
@@ -1483,20 +1489,47 @@
     makeToast({ kind: "success", message: `Removed ${name} from board` });
   }
 
-  function handleCreateAgent(form: { name: string; host: string; repo: string }) {
+  // New Agent Wizard (PLAN.md — Boardy wrote the contract before starting).
+  // Distinct kind from agent-request: this asks to create a brand-new
+  // agent from scratch, which always needs a supervisor (Le) to review
+  // before anything is spawned, per fleet practice — this only ever posts
+  // the request item, never spawns anything itself.
+  function handleCreateAgent(form: {
+    name: string;
+    host: string;
+    folder: string;
+    hasRepo: boolean;
+    repoUrl: string;
+    createRepo: boolean;
+    model: string;
+  }) {
+    if (!canEdit) return;
     if (!form.name.trim()) {
       makeToast({ kind: "error", message: "Agent name required." });
       return;
     }
-    postAgentRequest({
-      action: "create",
+    const payload = {
       name: form.name.trim(),
-      host: form.host.trim() || undefined,
-      repo: form.repo.trim() || undefined,
+      host: form.host.trim(),
+      folder: form.folder.trim(),
+      hasRepo: form.hasRepo,
+      ...(form.hasRepo ? { repoUrl: form.repoUrl.trim() } : { createRepo: form.createRepo }),
+      model: form.model,
       requestedBy: $settings.name || "someone",
       ts: Date.now(),
-    });
-    makeToast({ kind: "success", message: `Requested: create agent ${form.name}` });
+    };
+    const item: BoardItem = {
+      id: `agent-create:${crypto.randomUUID()}`,
+      kind: "agent-create",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: JSON.stringify(payload),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+    makeToast({ kind: "success", message: `Submitted "${form.name}" for review` });
   }
 
   // ── Right-click "New Node" context menu ──────────────────────────────────

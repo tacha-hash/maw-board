@@ -20,29 +20,55 @@
   // whenever enough people were connected (Louis hit this live).
   export let topPx = 80;
 
+  const MODELS = ["sonnet", "opus", "haiku"];
+
   const dispatch = createEventDispatcher<{
     close: void;
     addAgent: { name: string; mode: "view" | "interact" };
     removeAgent: string;
-    createAgent: { name: string; host: string; repo: string };
+    createAgent: {
+      name: string;
+      host: string;
+      folder: string;
+      hasRepo: boolean;
+      repoUrl: string;
+      createRepo: boolean;
+      model: string;
+    };
   }>();
 
   let showForm = false;
   let formName = "";
   let formHost = "";
-  let formRepo = "";
+  let formFolder = "";
+  let formHasRepo = true;
+  let formRepoUrl = "";
+  let formCreateRepo = false;
+  let formModel = MODELS[0];
+
+  function resetForm() {
+    formName = "";
+    formHost = "";
+    formFolder = "";
+    formHasRepo = true;
+    formRepoUrl = "";
+    formCreateRepo = false;
+    formModel = MODELS[0];
+    showForm = false;
+  }
 
   function submitForm() {
     if (!formName.trim()) return;
     dispatch("createAgent", {
       name: formName.trim(),
       host: formHost.trim(),
-      repo: formRepo.trim(),
+      folder: formFolder.trim(),
+      hasRepo: formHasRepo,
+      repoUrl: formHasRepo ? formRepoUrl.trim() : "",
+      createRepo: !formHasRepo && formCreateRepo,
+      model: formModel,
     });
-    formName = "";
-    formHost = "";
-    formRepo = "";
-    showForm = false;
+    resetForm();
   }
 </script>
 
@@ -63,9 +89,15 @@
     {/if}
     {#each agents as agent (agent.name)}
       {@const mirrored = onBoard.has(agent.name)}
-      <div class="row">
+      {@const sleeping = agent.status === "sleeping"}
+      <div class="row" class:sleeping>
         <span class="dot" class:online={mirrored} />
-        <span class="name" title={agent.host ?? ""}>{agent.name}</span>
+        <span
+          class="name"
+          title={sleeping ? "Sleeping — Add wakes it up" : agent.host ?? ""}
+        >
+          {agent.name}{#if sleeping}<span class="sleep-icon">💤</span>{/if}
+        </span>
         {#if mirrored}
           <button
             class="add-btn remove-btn"
@@ -105,18 +137,57 @@
   </div>
 
   {#if showForm}
+    <!-- New Agent Wizard (PLAN.md — new agent creation always needs a
+         supervisor per fleet practice; this only posts kind:"agent-create"
+         for Le to review, it never spawns anything itself). -->
     <div class="form">
       <input class="field" placeholder="Agent name" bind:value={formName} />
       <input class="field" placeholder="Host (e.g. pc, mac)" bind:value={formHost} />
-      <input class="field" placeholder="Repo (optional)" bind:value={formRepo} />
-      <div class="form-actions">
-        <button class="btn" on:click={() => (showForm = false)}>Cancel</button>
+      <input class="field" placeholder="Folder (working directory)" bind:value={formFolder} />
+
+      <div class="form-toggle">
         <button
-          class="btn btn-primary"
-          disabled={!formName.trim()}
-          on:click={submitForm}
+          class="toggle-btn"
+          class:selected={formHasRepo}
+          on:click={() => (formHasRepo = true)}
         >
-          Request
+          Has a repo
+        </button>
+        <button
+          class="toggle-btn"
+          class:selected={!formHasRepo}
+          on:click={() => (formHasRepo = false)}
+        >
+          No repo yet
+        </button>
+      </div>
+
+      {#if formHasRepo}
+        <input class="field" placeholder="Repo URL" bind:value={formRepoUrl} />
+      {:else}
+        <label class="checkbox-row">
+          <input type="checkbox" bind:checked={formCreateRepo} />
+          <span>Create a new repo for it</span>
+        </label>
+      {/if}
+
+      <div class="field-label">Model</div>
+      <div class="form-toggle">
+        {#each MODELS as m}
+          <button
+            class="toggle-btn"
+            class:selected={formModel === m}
+            on:click={() => (formModel = m)}
+          >
+            {m}
+          </button>
+        {/each}
+      </div>
+
+      <div class="form-actions">
+        <button class="btn" on:click={resetForm}>Cancel</button>
+        <button class="btn btn-primary" disabled={!formName.trim()} on:click={submitForm}>
+          Submit for review
         </button>
       </div>
     </div>
@@ -159,6 +230,15 @@
   .name {
     @apply flex-1 min-w-0 truncate text-zinc-200;
   }
+  .row.sleeping .name {
+    @apply text-zinc-500;
+  }
+  .row.sleeping .dot {
+    @apply bg-zinc-700;
+  }
+  .sleep-icon {
+    @apply ml-1 text-[10px];
+  }
   .actions {
     @apply flex gap-1 flex-none;
   }
@@ -189,6 +269,22 @@
   }
   .field {
     @apply px-2 py-1 rounded bg-zinc-800 text-sm text-zinc-100 outline-none ring-1 ring-zinc-700 focus:ring-indigo-500;
+  }
+  .field-label {
+    @apply text-[10px] uppercase tracking-wide text-zinc-500 mt-0.5;
+  }
+  .form-toggle {
+    @apply flex gap-1;
+  }
+  .toggle-btn {
+    @apply flex-1 text-xs px-1.5 py-1 rounded bg-zinc-800 text-zinc-300 ring-1 ring-zinc-700;
+    @apply hover:ring-indigo-500;
+  }
+  .toggle-btn.selected {
+    @apply bg-indigo-500/20 ring-indigo-500 text-indigo-200;
+  }
+  .checkbox-row {
+    @apply flex items-center gap-1.5 text-xs text-zinc-300 px-0.5;
   }
   .form-actions {
     @apply flex justify-end gap-1.5 mt-0.5;
