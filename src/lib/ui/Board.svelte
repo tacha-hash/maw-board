@@ -65,7 +65,11 @@
     error?: string;
   };
   // First entry matches the bridge's own fallback default (runKieJob's `m`).
-  const JOB_MODELS = ["nano-banana-pro", "flux-kontext", "imagen4", "seedream", "gpt-image"];
+  // Must match board-bridge.ts's MODEL_ALIASES keys exactly (confirmed by
+  // reading its source, commit 0f7f6d3) — anything else passes through to
+  // Kie unaliased and 422s (found live: "seedream" alone isn't a valid Kie
+  // model id, needs the "bytedance/seedream" the bridge maps it to).
+  const JOB_MODELS = ["nano-banana", "flux", "seedream", "gpt-image"];
   function parseJob(dataUrl: string): JobPayload {
     try {
       const parsed = JSON.parse(dataUrl);

@@ -343,6 +343,58 @@
     }
   }
 
+  // ── Link port/handle drag (PLAN.md — Louis wanted an easier, more
+  // intentional way to connect two nodes than "drag one terminal until it
+  // overlaps another", closer to the ComfyUI/xyflow mental model he already
+  // has). Drag from a terminal's port handle; drop on another terminal to
+  // link them. This is additive — the overlap-based auto-link above still
+  // works too, this just gives a precise, deliberate alternative gesture.
+  let linkDrawing: { fromId: number; pointerId: number; toWorld: [number, number] } | null = null;
+
+  function startLinkDraw(event: PointerEvent, fromId: number) {
+    if (!canEdit) return;
+    event.preventDefault();
+    event.stopPropagation();
+    linkDrawing = { fromId, pointerId: event.pointerId, toWorld: normalizePosition(event) };
+    window.addEventListener("pointermove", onLinkDrawMove);
+    window.addEventListener("pointerup", endLinkDraw);
+    window.addEventListener("pointercancel", cancelLinkDraw);
+  }
+
+  function onLinkDrawMove(event: PointerEvent) {
+    if (!linkDrawing || event.pointerId !== linkDrawing.pointerId) return;
+    linkDrawing = { ...linkDrawing, toWorld: normalizePosition(event) };
+  }
+
+  function endLinkDraw(event: PointerEvent) {
+    if (!linkDrawing || event.pointerId !== linkDrawing.pointerId) return;
+    const { fromId } = linkDrawing;
+    const [wx, wy] = normalizePosition(event);
+    // Point-in-rect: same world-space bounding-box assumption checkLinkOverlap
+    // above already relies on (offsetWidth/Height are world units here).
+    const target = shells.find(([sid, ws]) => {
+      if (sid === fromId) return false;
+      const el = termWrappers[sid];
+      if (!el) return false;
+      return (
+        wx >= ws.x && wx <= ws.x + el.offsetWidth && wy >= ws.y && wy <= ws.y + el.offsetHeight
+      );
+    });
+    if (target) createLink(fromId, target[0]);
+    cleanupLinkDraw();
+  }
+
+  function cancelLinkDraw() {
+    cleanupLinkDraw();
+  }
+
+  function cleanupLinkDraw() {
+    linkDrawing = null;
+    window.removeEventListener("pointermove", onLinkDrawMove);
+    window.removeEventListener("pointerup", endLinkDraw);
+    window.removeEventListener("pointercancel", cancelLinkDraw);
+  }
+
   /** Update the live frame shown for a stream tile. */
   function setStreamFrame(id: string, bytes: Uint8Array) {
     const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
@@ -1110,7 +1162,7 @@
       y,
       w: 300,
       h: 320,
-      dataUrl: JSON.stringify({ prompt: "", model: "nano-banana-pro", state: "draft" }),
+      dataUrl: JSON.stringify({ prompt: "", model: "nano-banana", state: "draft" }),
     };
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
@@ -1135,12 +1187,12 @@
         : "draft";
       return {
         prompt: typeof p.prompt === "string" ? p.prompt : "",
-        model: typeof p.model === "string" ? p.model : "nano-banana-pro",
+        model: typeof p.model === "string" ? p.model : "nano-banana",
         state,
         error: typeof p.error === "string" ? p.error : undefined,
       };
     } catch {
-      return { prompt: "", model: "nano-banana-pro", state: "draft" };
+      return { prompt: "", model: "nano-banana", state: "draft" };
     }
   }
 
@@ -1235,25 +1287,70 @@
   }
 
   // Field name here MUST be `agent`, not `name` — board-bridge.ts v2 reads
-  // `req.agent` (confirmed by reading its source directly), and doesn't
-  // check `action` at all — it treats every agent-request item as an add
-  // attempt. That's also why "remove" below posts no board item at all:
-  // one would get silently (mis)treated as another add attempt otherwise.
-  function handleAddAgentToBoard(name: string) {
+  // `req.agent` (confirmed by reading its source directly), and only acts
+  // on `action === "add"` (hardened after an earlier finding of mine — it
+  // used to process any agent-request unconditionally). `mode` picks the
+  // spawn-queue kind bridge-side: "view" (default, read-only) or
+  // "interact" (writable — PLAN.md, Louis approved 2026-07-06 ค่ำ; typing
+  // reaches the real agent's terminal). "remove" posts no board item at
+  // all — one would get silently (mis)treated as another add attempt.
+  function handleAddAgentToBoard(name: string, mode: "view" | "interact") {
     postAgentRequest({
       action: "add",
       agent: name,
+      mode,
       requestedBy: $settings.name || "someone",
       ts: Date.now(),
     });
-    makeToast({ kind: "success", message: `Requested: add ${name} to board` });
+    queuePendingAgentLabel(name, mode);
+    makeToast({
+      kind: "success",
+      message:
+        mode === "interact"
+          ? `Requested: INTERACT with ${name} — typing will reach the real agent`
+          : `Requested: view ${name}`,
+    });
+  }
+
+  // The shell bridge's `{create}` trigger spawns has NO label of its own —
+  // unlike spawn-fleet-mirrors.ts's Playwright automation, which types a
+  // name into the rename UI after creating each mirror, nothing here labels
+  // the new terminal, so mirroredAgents (below) would never detect it.
+  // Track pending "Add" requests in FIFO order (matching the spawn-queue's
+  // own FIFO order server-side) and auto-label the next NEW shell that
+  // appears with the oldest pending name — pruned after 20s so a rejected
+  // Add (unknown agent — bridge sends a chat error, no shell ever appears)
+  // can't linger and mislabel some later, unrelated "+ New Terminal" click.
+  // Interact-mode labels get a loud "[INTERACT]" suffix — the terminal
+  // title is the only always-visible cue that typing there is live/real.
+  const PENDING_LABEL_TIMEOUT_MS = 20_000;
+  let pendingAgentLabels: { name: string; label: string; ts: number }[] = [];
+  let knownShellIds = new Set<number>();
+
+  function queuePendingAgentLabel(name: string, mode: "view" | "interact") {
+    const label = mode === "interact" ? `${name} [INTERACT]` : name;
+    pendingAgentLabels = [...pendingAgentLabels, { name, label, ts: Date.now() }];
+  }
+
+  $: {
+    const now = Date.now();
+    pendingAgentLabels = pendingAgentLabels.filter((p) => now - p.ts < PENDING_LABEL_TIMEOUT_MS);
+    const currentIds = new Set(shells.map(([sid]) => sid));
+    for (const sid of currentIds) {
+      if (!knownShellIds.has(sid) && pendingAgentLabels.length > 0) {
+        const next = pendingAgentLabels[0];
+        pendingAgentLabels = pendingAgentLabels.slice(1);
+        handleRename(sid, next.label);
+      }
+    }
+    knownShellIds = currentIds;
   }
 
   // Which roster agents currently have a mirror shell open — matched against
-  // terminal labels (kind:"label", set by spawn-fleet-mirrors.ts/rename UI)
-  // since there's no other per-shell "this is agent X" pointer today. Labels
-  // are freeform ("secretary-oracle (agents:2)") so this is a substring
-  // match.
+  // terminal labels (kind:"label", set either by the auto-label above or
+  // spawn-fleet-mirrors.ts's rename automation) since there's no other
+  // per-shell "this is agent X" pointer today. Labels are freeform
+  // ("secretary-oracle (agents:2)") so this is a substring match.
   $: mirroredAgents = new Set(
     roster.agents
       .map((a) => a.name)
@@ -2256,6 +2353,7 @@
     cameraStream?.getTracks().forEach((t) => t.stop());
     for (const audio of Object.values(remoteAudios)) audio.pause();
     for (const url of Object.values(streamSrcs)) URL.revokeObjectURL(url);
+    if (linkDrawing) cleanupLinkDraw();
     // Drop the board-color we painted on the document so SPA nav back to the
     // landing page doesn't inherit it (falls back to the stylesheet).
     if (typeof document !== "undefined") {
@@ -2411,7 +2509,7 @@
       onBoard={mirroredAgents}
       {canEdit}
       on:close={() => (showRoster = false)}
-      on:addAgent={({ detail }) => handleAddAgentToBoard(detail)}
+      on:addAgent={({ detail }) => handleAddAgentToBoard(detail.name, detail.mode)}
       on:removeAgent={({ detail }) => handleRemoveAgentFromBoard(detail)}
       on:createAgent={({ detail }) => handleCreateAgent(detail)}
     />
@@ -2574,62 +2672,6 @@
       />
     {/if}
 
-    <!-- Node-based drag-to-connect: link lines render UNDER the terminals
-         they connect (document order = z-order here), so they read as
-         cables plugging into the windows rather than obscuring them. -->
-    {#each boardItems as item (item.id)}
-      {@const link = linkEndpoints(item)}
-      {#if link}
-        {@const shellA = shells.find(([sid]) => sid === link.a)}
-        {@const shellB = shells.find(([sid]) => sid === link.b)}
-        {#if shellA && shellB}
-          {@const wsA = link.a === moving ? movingSize : shellA[1]}
-          {@const wsB = link.b === moving ? movingSize : shellB[1]}
-          {@const elA = termWrappers[link.a]}
-          {@const elB = termWrappers[link.b]}
-          {@const centerAx = wsA.x + (elA?.offsetWidth ?? 0) / 2}
-          {@const centerAy = wsA.y + (elA?.offsetHeight ?? 0) / 2}
-          {@const centerBx = wsB.x + (elB?.offsetWidth ?? 0) / 2}
-          {@const centerBy = wsB.y + (elB?.offsetHeight ?? 0) / 2}
-          {@const anchorX = Math.min(centerAx, centerBx)}
-          {@const anchorY = Math.min(centerAy, centerBy)}
-          {@const lineW = Math.max(Math.abs(centerBx - centerAx), 1)}
-          {@const lineH = Math.max(Math.abs(centerBy - centerAy), 1)}
-          <div
-            class="absolute pointer-events-none"
-            style:left={OFFSET_LEFT_CSS}
-            style:top={OFFSET_TOP_CSS}
-            style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
-            use:slide={{ x: anchorX, y: anchorY, center, zoom, immediate: true }}
-          >
-            <svg width={lineW} height={lineH} style="overflow: visible;">
-              <line
-                x1={centerAx <= centerBx ? 0 : lineW}
-                y1={centerAy <= centerBy ? 0 : lineH}
-                x2={centerAx <= centerBx ? lineW : 0}
-                y2={centerAy <= centerBy ? lineH : 0}
-                stroke="#818cf8"
-                stroke-width="3"
-                stroke-dasharray="8 6"
-              />
-            </svg>
-            {#if canEdit}
-              <button
-                class="pointer-events-auto absolute flex h-5 w-5 items-center justify-center rounded-full bg-indigo-500 text-xs text-white shadow hover:bg-red-500"
-                style:left={`${lineW / 2 - 10}px`}
-                style:top={`${lineH / 2 - 10}px`}
-                title="Unlink"
-                on:pointerdown={(e) => e.stopPropagation()}
-                on:click={() => removeLink(link.a, link.b)}
-              >
-                ✕
-              </button>
-            {/if}
-          </div>
-        {/if}
-      {/if}
-    {/each}
-
     {#each shells as [id, winsize] (id)}
       {@const ws = id === moving ? movingSize : winsize}
       <div
@@ -2724,8 +2766,122 @@
             }
           }}
         />
+
+        <!-- Link port/handle (PLAN.md — Louis: drag-overlap-to-link was hard
+             to use, wants a ComfyUI/xyflow-style connection point instead).
+             Drag from here to another terminal to link them — same
+             createLink() the old drag-overlap gesture uses, just a more
+             precise, intentional trigger. Overlap-to-link still also works
+             (harmless, kept for casual drags), this is an easier addition,
+             not a replacement. -->
+        {#if canEdit}
+          <button
+            class="link-port absolute w-5 h-5 -right-2.5 top-1/2 -translate-y-1/2 rounded-full cursor-crosshair touch-none"
+            title="Drag to connect to another node"
+            on:pointerdown={(event) => startLinkDraw(event, id)}
+          >
+            ⊙
+          </button>
+        {/if}
       </div>
     {/each}
+
+    <!-- Node-based drag-to-connect: link lines render ABOVE the terminals
+         (after them in document order) so the full line is always visible
+         end-to-end, not just in the gaps between windows — Louis: the old
+         under-terminal z-order (see git history) meant most of a link was
+         invisible whenever it crossed a window. `pointer-events: none` on
+         the line itself still lets clicks reach the terminal underneath. -->
+    {#each boardItems as item (item.id)}
+      {@const link = linkEndpoints(item)}
+      {#if link}
+        {@const shellA = shells.find(([sid]) => sid === link.a)}
+        {@const shellB = shells.find(([sid]) => sid === link.b)}
+        {#if shellA && shellB}
+          {@const wsA = link.a === moving ? movingSize : shellA[1]}
+          {@const wsB = link.b === moving ? movingSize : shellB[1]}
+          {@const elA = termWrappers[link.a]}
+          {@const elB = termWrappers[link.b]}
+          {@const centerAx = wsA.x + (elA?.offsetWidth ?? 0) / 2}
+          {@const centerAy = wsA.y + (elA?.offsetHeight ?? 0) / 2}
+          {@const centerBx = wsB.x + (elB?.offsetWidth ?? 0) / 2}
+          {@const centerBy = wsB.y + (elB?.offsetHeight ?? 0) / 2}
+          {@const anchorX = Math.min(centerAx, centerBx)}
+          {@const anchorY = Math.min(centerAy, centerBy)}
+          {@const lineW = Math.max(Math.abs(centerBx - centerAx), 1)}
+          {@const lineH = Math.max(Math.abs(centerBy - centerAy), 1)}
+          <div
+            class="absolute pointer-events-none"
+            style:left={OFFSET_LEFT_CSS}
+            style:top={OFFSET_TOP_CSS}
+            style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+            use:slide={{ x: anchorX, y: anchorY, center, zoom, immediate: true }}
+          >
+            <svg width={lineW} height={lineH} style="overflow: visible;">
+              <line
+                x1={centerAx <= centerBx ? 0 : lineW}
+                y1={centerAy <= centerBy ? 0 : lineH}
+                x2={centerAx <= centerBx ? lineW : 0}
+                y2={centerAy <= centerBy ? lineH : 0}
+                stroke="#818cf8"
+                stroke-width="3"
+                stroke-dasharray="8 6"
+              />
+            </svg>
+            {#if canEdit}
+              <button
+                class="pointer-events-auto absolute flex h-5 w-5 items-center justify-center rounded-full bg-indigo-500 text-xs text-white shadow hover:bg-red-500"
+                style:left={`${lineW / 2 - 10}px`}
+                style:top={`${lineH / 2 - 10}px`}
+                title="Unlink"
+                on:pointerdown={(e) => e.stopPropagation()}
+                on:click={() => removeLink(link.a, link.b)}
+              >
+                ✕
+              </button>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+    {/each}
+
+    <!-- Live preview line while dragging from a link-port (see startLinkDraw)
+         — follows the cursor until dropped on another terminal. -->
+    {#if linkDrawing}
+      {@const drawing = linkDrawing}
+      {@const fromShell = shells.find(([sid]) => sid === drawing.fromId)}
+      {#if fromShell}
+        {@const fromWs = drawing.fromId === moving ? movingSize : fromShell[1]}
+        {@const fromEl = termWrappers[drawing.fromId]}
+        {@const fromX = fromWs.x + (fromEl?.offsetWidth ?? 0) / 2}
+        {@const fromY = fromWs.y + (fromEl?.offsetHeight ?? 0) / 2}
+        {@const toX = drawing.toWorld[0]}
+        {@const toY = drawing.toWorld[1]}
+        {@const previewAnchorX = Math.min(fromX, toX)}
+        {@const previewAnchorY = Math.min(fromY, toY)}
+        {@const previewW = Math.max(Math.abs(toX - fromX), 1)}
+        {@const previewH = Math.max(Math.abs(toY - fromY), 1)}
+        <div
+          class="absolute pointer-events-none"
+          style:left={OFFSET_LEFT_CSS}
+          style:top={OFFSET_TOP_CSS}
+          style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+          use:slide={{ x: previewAnchorX, y: previewAnchorY, center, zoom, immediate: true }}
+        >
+          <svg width={previewW} height={previewH} style="overflow: visible;">
+            <line
+              x1={fromX <= toX ? 0 : previewW}
+              y1={fromY <= toY ? 0 : previewH}
+              x2={fromX <= toX ? previewW : 0}
+              y2={fromY <= toY ? previewH : 0}
+              stroke="#a5b4fc"
+              stroke-width="3"
+              stroke-dasharray="4 4"
+            />
+          </svg>
+        </div>
+      {/if}
+    {/if}
 
     {#each users.filter(([id, user]) => id !== userId && user.cursor !== null) as [id, user] (id)}
       <div

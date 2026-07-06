@@ -12,12 +12,12 @@
   export let agents: { name: string; host?: string; status?: string }[] = [];
   export let canEdit: boolean;
   // Names currently mirrored on the board (matched against terminal labels
-  // by Session.svelte) — toggles each row between "+ Add" and "Remove".
+  // by Session.svelte) — toggles each row between View/Interact and Remove.
   export let onBoard: Set<string> = new Set();
 
   const dispatch = createEventDispatcher<{
     close: void;
-    addAgent: string;
+    addAgent: { name: string; mode: "view" | "interact" };
     removeAgent: string;
     createAgent: { name: string; host: string; repo: string };
   }>();
@@ -71,14 +71,29 @@
             Remove
           </button>
         {:else}
-          <button
-            class="add-btn"
-            disabled={!canEdit}
-            title="Add to board"
-            on:click={() => dispatch("addAgent", agent.name)}
-          >
-            + Add
-          </button>
+          <!-- Louis's call (2026-07-06 ค่ำ, reversed an earlier direction of
+               mine): Add's primary action IS a writable terminal by default
+               — typing reaches the real agent, "like sitting in front of
+               the machine". View (read-only) is the secondary, icon-only
+               button for when you just want to watch. -->
+          <div class="actions">
+            <button
+              class="icon-btn"
+              disabled={!canEdit}
+              title="View (read-only)"
+              on:click={() => dispatch("addAgent", { name: agent.name, mode: "view" })}
+            >
+              👁
+            </button>
+            <button
+              class="add-btn interact-btn"
+              disabled={!canEdit}
+              title="Add — writable, typing reaches the real agent, like sitting in front of the machine"
+              on:click={() => dispatch("addAgent", { name: agent.name, mode: "interact" })}
+            >
+              + Add
+            </button>
+          </div>
         {/if}
       </div>
     {/each}
@@ -126,7 +141,7 @@
     @apply flex-1 overflow-y-auto py-1 text-sm;
   }
   .row {
-    @apply flex items-center gap-2 px-3 py-1.5 hover:bg-white/5;
+    @apply flex items-center gap-1.5 px-3 py-1.5 hover:bg-white/5;
   }
   .dot {
     @apply w-2 h-2 rounded-full bg-zinc-600 flex-none;
@@ -135,14 +150,25 @@
     @apply bg-emerald-400;
   }
   .name {
-    @apply flex-1 truncate text-zinc-200;
+    @apply flex-1 min-w-0 truncate text-zinc-200;
+  }
+  .actions {
+    @apply flex gap-1 flex-none;
   }
   .add-btn {
-    @apply text-[11px] px-1.5 py-0.5 rounded bg-zinc-700/60 text-zinc-200 flex-none;
+    @apply text-[11px] px-1.5 py-0.5 rounded bg-zinc-700/60 text-zinc-200 flex-none whitespace-nowrap;
     @apply hover:bg-indigo-600 hover:text-white disabled:opacity-40 disabled:hover:bg-zinc-700/60;
   }
   .remove-btn {
     @apply hover:bg-red-600 disabled:hover:bg-zinc-700/60;
+  }
+  .interact-btn {
+    @apply bg-amber-900/40 text-amber-200 hover:bg-amber-600 hover:text-white;
+    @apply disabled:hover:bg-amber-900/40;
+  }
+  .icon-btn {
+    @apply text-xs w-5 h-5 flex items-center justify-center rounded flex-none;
+    @apply bg-zinc-700/60 hover:bg-zinc-600 disabled:opacity-40 disabled:hover:bg-zinc-700/60;
   }
   .muted {
     @apply px-3 py-1 text-xs text-zinc-500;
