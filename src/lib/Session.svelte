@@ -209,6 +209,10 @@
   const writers: Record<number, (data: string) => void> = {};
   const termWrappers: Record<number, HTMLDivElement> = {};
   const termElements: Record<number, HTMLDivElement> = {};
+  /** Shell id under an in-flight asset drag from Board (bind:dropTargetShellId
+   * — Vision Round 3 item 2, docs/vision-round3-asset-to-cli-design.md), used
+   * only to highlight the terminal about to receive the drop. */
+  let dropTargetShellId: number | null = null;
   const chunknums: Record<number, number> = {};
   const locks: Record<number, any> = {};
   let userId = 0;
@@ -1324,6 +1328,28 @@
     };
     upsertBoardItem(updated);
     srocket?.send({ boardPut: updated });
+  }
+
+  // Vision Round 3 item 2 — asset-to-CLI (docs/vision-round3-asset-to-cli-
+  // design.md, bridge side done in tools/board-bridge.ts). This is a
+  // one-shot command item, not a visible tile (w:0/h:0, same convention as
+  // agent-request/agent-create/link) — the bridge resolves shell_id → agent
+  // via its own shellLabels/labelToAgent, writes the asset to a file, and
+  // heys the agent the path. No canEdit-less path here: dropping is an edit
+  // like any other board mutation.
+  function handleAssetDropOnShell(assetItemId: string, shellId: number) {
+    if (!canEdit) return;
+    const item: BoardItem = {
+      id: `asset-drop:${crypto.randomUUID()}`,
+      kind: "asset-drop",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: JSON.stringify({ asset_item_id: assetItemId, shell_id: shellId }),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
   }
 
   // The actual "post a job" moment per PLAN.md — bridge watches for
@@ -2802,6 +2828,7 @@
       {snapTargets}
       extraGuidesV={termGuidesV}
       extraGuidesH={termGuidesH}
+      bind:dropTargetShellId
       on:move={({ detail }) =>
         handleBoardMove(detail.id, detail.x, detail.y)}
       on:resize={({ detail }) =>
@@ -2815,6 +2842,7 @@
       on:jobRemoveImageRef={({ detail }) => handleJobRemoveImageRef(detail.id, detail.index)}
       on:jobSetEndFrame={({ detail }) => handleJobSetEndFrame(detail.id, detail.imageItemId)}
       on:jobClearEndFrame={({ detail }) => handleJobClearEndFrame(detail)}
+      on:assetDropOnShell={({ detail }) => handleAssetDropOnShell(detail.assetItemId, detail.shellId)}
     />
 
     {#if contextMenu}
@@ -2853,12 +2881,16 @@
       {@const ws = id === moving ? movingSize : winsize}
       <div
         class="absolute"
+        class:ring-2={dropTargetShellId === id}
+        class:ring-amber-400={dropTargetShellId === id}
+        class:rounded-md={dropTargetShellId === id}
         style:left={OFFSET_LEFT_CSS}
         style:top={OFFSET_TOP_CSS}
         style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
         transition:fade|local
         use:slide={{ x: ws.x, y: ws.y, center, zoom, immediate: id === moving }}
         bind:this={termWrappers[id]}
+        data-shell-id={id}
       >
         <XTerm
           rows={ws.rows}

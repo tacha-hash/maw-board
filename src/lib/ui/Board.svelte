@@ -41,6 +41,12 @@
   /** Guide lines from a terminal drag (Session), rendered on the same fabric. */
   export let extraGuidesV: number[] = [];
   export let extraGuidesH: number[] = [];
+  /** Shell (terminal) id currently under an asset drag, for Session's own
+   * highlight — shells are Session-owned DOM, outside this component, so we
+   * can only report the id up rather than binding a wrapper dict like
+   * jobTileWrappers below. `null` when no asset drag is in flight or the
+   * pointer isn't over a shell. */
+  export let dropTargetShellId: number | null = null;
 
   // Screen-space snap distance; converted to world units (÷ zoom) so the pull
   // feels the same regardless of how far the board is zoomed.
@@ -87,6 +93,8 @@
     /** An i2v end-frame reference (dragged from an image tile) was dropped onto this job node. */
     jobSetEndFrame: { id: string; imageItemId: string };
     jobClearEndFrame: string;
+    /** An image/video/job asset was dropped onto an agent's terminal (Session-owned shell). */
+    assetDropOnShell: { assetItemId: string; shellId: number };
   }>();
 
   // ── Gen job node (image or video) — dataUrl is a JSON payload, not raw
@@ -167,20 +175,27 @@
     window.removeEventListener("pointercancel", endResize);
   }
 
-  // ── Image-reference drag (dottodot parity — "ลากรูปจากบอร์ดใส่ได้"): drag
-  // an image tile's 📎 handle onto a job node to attach it as an i2i
-  // reference. Both image tiles and job nodes render in this same
-  // `{#each items}` loop, so — unlike the link-port drag in Session.svelte,
-  // which had to coordinate across two components — this drag/drop-target
-  // detection lives entirely here. `jobTileWrappers` binds each job node's
-  // element for hit-testing (same technique termWrappers uses elsewhere).
+  // ── Asset drag (dottodot parity — "ลากรูปจากบอร์ดใส่ได้" — extended by
+  // Vision Round 3 item 2 to video tiles + whole job nodes, and to a new
+  // drop target: an agent's terminal, docs/vision-round3-asset-to-cli-
+  // design.md): drag an image/video tile's 📎 handle (or a job node's own
+  // handle) onto either a job node (i2i ref / end-frame) or a terminal
+  // (asset-to-CLI). Image/job tiles render in this same `{#each items}`
+  // loop, so job-node/end-frame hit-testing lives entirely here the same
+  // way it always has (`jobTileWrappers`). Terminals are Session-owned DOM
+  // outside this component — `document.elementFromPoint` finds them via a
+  // `data-shell-id` attribute Session puts on its termWrapper div, rather
+  // than sharing a wrapper dict across components.
   const jobTileWrappers: Record<string, HTMLDivElement> = {};
   // End-frame slots (Vision Round 3 — video i2v) are a smaller, more specific
   // drop target nested inside a job node — checked first so dropping exactly
   // on the end-frame box doesn't get swallowed by the whole-node ref target.
   const endFrameSlotWrappers: Record<string, HTMLDivElement> = {};
-  let imageDragImageId: string | null = null;
-  let imageDragPointerId: number | null = null;
+  let assetDragItemId: string | null = null;
+  /** i2i ref / end-frame targets only make sense for images — video/job
+   * drags skip straight to shell-hit-testing. */
+  let assetDragKind: "image" | "video" | "job" | null = null;
+  let assetDragPointerId: number | null = null;
   let dropTargetJobId: string | null = null;
   let dropTargetEndFrameId: string | null = null;
 
@@ -200,49 +215,85 @@
     return null;
   }
 
-  function startImageDrag(event: PointerEvent, imageItemId: string) {
+  // Terminals live outside this component's DOM subtree (Session owns
+  // `shells`/`termWrappers`) — hit-test the live DOM instead of a shared
+  // wrapper dict. Safe because `elementFromPoint` resolves post-transform
+  // screen coords, same basis `getBoundingClientRect()` above already uses.
+  function findShellUnderPoint(x: number, y: number): number | null {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    const wrapper = el?.closest<HTMLElement>("[data-shell-id]");
+    const idStr = wrapper?.dataset.shellId;
+    if (idStr === undefined) return null;
+    const id = parseInt(idStr, 10);
+    return isNaN(id) ? null : id;
+  }
+
+  function startAssetDrag(event: PointerEvent, itemId: string, kind: "image" | "video" | "job") {
     if (hasWriteAccess === false) return;
     event.preventDefault();
     event.stopPropagation();
-    imageDragImageId = imageItemId;
-    imageDragPointerId = event.pointerId ?? null;
-    window.addEventListener("pointermove", onImageDragMove);
-    window.addEventListener("pointerup", endImageDrag);
-    window.addEventListener("pointercancel", cancelImageDrag);
+    assetDragItemId = itemId;
+    assetDragKind = kind;
+    assetDragPointerId = event.pointerId ?? null;
+    window.addEventListener("pointermove", onAssetDragMove);
+    window.addEventListener("pointerup", endAssetDrag);
+    window.addEventListener("pointercancel", cancelAssetDrag);
   }
 
-  function onImageDragMove(event: PointerEvent) {
-    if (imageDragImageId === null || event.pointerId !== imageDragPointerId) return;
-    dropTargetEndFrameId = findEndFrameSlotUnderPoint(event.clientX, event.clientY);
-    dropTargetJobId = dropTargetEndFrameId ? null : findJobUnderPoint(event.clientX, event.clientY);
-  }
-
-  function endImageDrag(event: PointerEvent) {
-    if (imageDragImageId === null || event.pointerId !== imageDragPointerId) return;
-    const endFrameId = findEndFrameSlotUnderPoint(event.clientX, event.clientY);
-    if (endFrameId) {
-      dispatch("jobSetEndFrame", { id: endFrameId, imageItemId: imageDragImageId });
+  function onAssetDragMove(event: PointerEvent) {
+    if (assetDragItemId === null || event.pointerId !== assetDragPointerId) return;
+    const { clientX: x, clientY: y } = event;
+    if (assetDragKind === "image") {
+      dropTargetEndFrameId = findEndFrameSlotUnderPoint(x, y);
+      dropTargetShellId = dropTargetEndFrameId ? null : findShellUnderPoint(x, y);
+      dropTargetJobId = dropTargetEndFrameId || dropTargetShellId !== null ? null : findJobUnderPoint(x, y);
     } else {
-      const targetId = findJobUnderPoint(event.clientX, event.clientY);
-      if (targetId) {
-        dispatch("jobAddImageRef", { id: targetId, imageItemId: imageDragImageId });
-      }
+      dropTargetEndFrameId = null;
+      dropTargetJobId = null;
+      dropTargetShellId = findShellUnderPoint(x, y);
     }
-    cleanupImageDrag();
   }
 
-  function cancelImageDrag() {
-    cleanupImageDrag();
+  function endAssetDrag(event: PointerEvent) {
+    if (assetDragItemId === null || event.pointerId !== assetDragPointerId) return;
+    const { clientX: x, clientY: y } = event;
+    const assetItemId = assetDragItemId;
+    if (assetDragKind === "image") {
+      const endFrameId = findEndFrameSlotUnderPoint(x, y);
+      if (endFrameId) {
+        dispatch("jobSetEndFrame", { id: endFrameId, imageItemId: assetItemId });
+        cleanupAssetDrag();
+        return;
+      }
+      const shellId = findShellUnderPoint(x, y);
+      if (shellId !== null) {
+        dispatch("assetDropOnShell", { assetItemId, shellId });
+        cleanupAssetDrag();
+        return;
+      }
+      const targetId = findJobUnderPoint(x, y);
+      if (targetId) dispatch("jobAddImageRef", { id: targetId, imageItemId: assetItemId });
+    } else {
+      const shellId = findShellUnderPoint(x, y);
+      if (shellId !== null) dispatch("assetDropOnShell", { assetItemId, shellId });
+    }
+    cleanupAssetDrag();
   }
 
-  function cleanupImageDrag() {
-    imageDragImageId = null;
-    imageDragPointerId = null;
+  function cancelAssetDrag() {
+    cleanupAssetDrag();
+  }
+
+  function cleanupAssetDrag() {
+    assetDragItemId = null;
+    assetDragKind = null;
+    assetDragPointerId = null;
     dropTargetJobId = null;
     dropTargetEndFrameId = null;
-    window.removeEventListener("pointermove", onImageDragMove);
-    window.removeEventListener("pointerup", endImageDrag);
-    window.removeEventListener("pointercancel", cancelImageDrag);
+    dropTargetShellId = null;
+    window.removeEventListener("pointermove", onAssetDragMove);
+    window.removeEventListener("pointerup", endAssetDrag);
+    window.removeEventListener("pointercancel", cancelAssetDrag);
   }
 
   // Drag state. While dragging, the dragged tile renders at `dragPos` and sends
@@ -433,13 +484,13 @@
     window.removeEventListener("pointermove", onResize);
     window.removeEventListener("pointerup", endResize);
     window.removeEventListener("pointercancel", endResize);
-    window.removeEventListener("pointermove", onImageDragMove);
-    window.removeEventListener("pointerup", endImageDrag);
-    window.removeEventListener("pointercancel", cancelImageDrag);
+    window.removeEventListener("pointermove", onAssetDragMove);
+    window.removeEventListener("pointerup", endAssetDrag);
+    window.removeEventListener("pointercancel", cancelAssetDrag);
   });
 </script>
 
-{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock" && it.kind !== "label" && it.kind !== "link") as item (item.id)}
+{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock" && it.kind !== "label" && it.kind !== "link" && it.kind !== "asset-drop") as item (item.id)}
   {@const x = item.id === dragId ? dragPos[0] : item.x}
   {@const y = item.id === dragId ? dragPos[1] : item.y}
   <div
@@ -495,6 +546,24 @@
               >
                 <VideoIcon size="12" />
               </button>
+              {#if hasWriteAccess !== false}
+                <!-- Vision Round 3 item 2: drag the whole node (prompt +
+                     model, result too if done) onto an agent's terminal to
+                     share it — disabled with no prompt yet, since an
+                     empty-prompt hey is just noise (Le, PROGRESS.md
+                     2026-07-07 01:56). -->
+                <button
+                  class="job-drag-handle"
+                  title="Drag onto an agent's terminal to share this job"
+                  disabled={!job.prompt.trim()}
+                  on:pointerdown={(event) => {
+                    event.stopPropagation();
+                    startAssetDrag(event, item.id, "job");
+                  }}
+                >
+                  <PaperclipIcon size="12" />
+                </button>
+              {/if}
             </div>
           </div>
 
@@ -782,13 +851,17 @@
         </button>
       {/if}
 
-      {#if item.kind === "image" && hasWriteAccess !== false}
-        <!-- dottodot parity: "ลากรูปจากบอร์ดใส่ได้" — drag this onto a job
-             node's reference-images section to use as an i2i input. -->
+      {#if (item.kind === "image" || item.kind === "video") && hasWriteAccess !== false}
+        <!-- dottodot parity: "ลากรูปจากบอร์ดใส่ได้" — drag an image onto a job
+             node's reference-images/end-frame section to use as input, or
+             drag either onto an agent's terminal to share it (Vision Round 3
+             item 2, docs/vision-round3-asset-to-cli-design.md). -->
         <button
           class="ref-handle"
-          title="Drag onto a job node to use as an i2i reference"
-          on:pointerdown={(event) => startImageDrag(event, item.id)}
+          title={item.kind === "image"
+            ? "Drag onto a job node to use as a reference, or an agent's terminal to share it"
+            : "Drag onto an agent's terminal to share it"}
+          on:pointerdown={(event) => startAssetDrag(event, item.id, item.kind === "video" ? "video" : "image")}
         >
           <PaperclipIcon size="12" />
         </button>
@@ -1062,6 +1135,12 @@
 
   .media-type-btn.selected {
     @apply bg-indigo-500/20 ring-indigo-500 text-indigo-200;
+  }
+
+  .job-drag-handle {
+    @apply p-1 ml-1 rounded bg-zinc-800 text-zinc-500 ring-1 ring-zinc-700 flex-none;
+    @apply hover:bg-amber-600 hover:text-white cursor-grab touch-none disabled:opacity-30;
+    @apply disabled:cursor-not-allowed disabled:hover:bg-zinc-800 disabled:hover:text-zinc-500;
   }
 
   .job-negative-prompt {
