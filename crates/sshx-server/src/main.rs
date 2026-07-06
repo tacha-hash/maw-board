@@ -48,6 +48,10 @@ struct Args {
     /// Path to the directory containing static assets.
     #[clap(long, default_value = "build")]
     static_dir: String,
+
+    /// Directory for durable board persistence (boards survive restarts).
+    #[clap(long, env = "SSHX_PERSIST_DIR")]
+    persist_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -65,6 +69,7 @@ async fn start(args: Args) -> Result<()> {
     options.board_password = args.board_password;
     options.oracle_url_file = args.oracle_url_file;
     options.static_dir = Some(args.static_dir);
+    options.persist_dir = args.persist_dir;
 
     let server = Server::new(options)?;
 

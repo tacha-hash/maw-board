@@ -53,6 +53,9 @@ pub struct ServerOptions {
 
     /// Path to the directory containing static assets.
     pub static_dir: Option<String>,
+
+    /// Directory for durable board persistence (boards survive restarts).
+    pub persist_dir: Option<String>,
 }
 
 /// Stateful object that manages the sshx server, with graceful termination.

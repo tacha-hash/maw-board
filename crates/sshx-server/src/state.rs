@@ -13,10 +13,12 @@ use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::error;
 
+use self::disk::StorageDisk;
 use self::mesh::StorageMesh;
 use crate::session::Session;
 use crate::ServerOptions;
 
+pub mod disk;
 pub mod mesh;
 
 /// Timeout for a disconnected session to be evicted and closed.
@@ -43,6 +45,9 @@ pub struct ServerState {
     /// Storage and distributed communication provider, if enabled.
     mesh: Option<StorageMesh>,
 
+    /// Durable on-disk session persistence, if enabled (`--persist-dir`).
+    disk: Option<StorageDisk>,
+
     /// Path to the file containing the active oracle session URL.
     oracle_url_file: String,
 
@@ -58,6 +63,10 @@ impl ServerState {
             Some(url) => Some(StorageMesh::new(&url, options.host.as_deref())?),
             None => None,
         };
+        let disk = match options.persist_dir {
+            Some(ref dir) => Some(StorageDisk::new(dir)?),
+            None => None,
+        };
         let oracle_url_file = options
             .oracle_url_file
             .unwrap_or_else(|| "/root/.sshx-oracle-url.txt".to_string());
@@ -70,6 +79,7 @@ impl ServerState {
             board_password: options.board_password.filter(|p| !p.is_empty()),
             store: DashMap::new(),
             mesh,
+            disk,
             oracle_url_file,
             static_dir,
         })
@@ -105,8 +115,26 @@ impl ServerState {
         self.store.get(name).map(|s| s.clone())
     }
 
+    /// Returns the disk persistence layer, if enabled.
+    pub fn disk(&self) -> Option<&StorageDisk> {
+        self.disk.as_ref()
+    }
+
+    /// Names of all sessions currently live in memory.
+    pub fn live_session_names(&self) -> Vec<String> {
+        self.store.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Insert a session into the local store.
     pub fn insert(&self, name: &str, session: Arc<Session>) {
+        if let Some(disk) = &self.disk {
+            let name = name.to_string();
+            let session = session.clone();
+            let disk = disk.clone();
+            tokio::spawn(async move {
+                disk.background_sync(&name, session).await;
+            });
+        }
         if let Some(mesh) = &self.mesh {
             let name = name.to_string();
             let session = session.clone();
@@ -136,7 +164,23 @@ impl ServerState {
         if let Some(mesh) = &self.mesh {
             mesh.mark_closed(name).await?;
         }
+        if let Some(disk) = &self.disk {
+            disk.delete(name); // permanent close = forget the board
+        }
         Ok(())
+    }
+
+    /// Evict an idle session from memory WITHOUT deleting its persisted
+    /// snapshot — the board "sleeps" on disk and can be reopened later.
+    async fn evict_session(&self, name: &str) -> Result<()> {
+        if let Some(disk) = &self.disk {
+            if let Some(session) = self.lookup(name) {
+                disk.save(name, &session.snapshot()?)?;
+            }
+            self.remove(name);
+            return Ok(());
+        }
+        self.close_session(name).await
     }
 
     /// Connect to a session by name from the `sshx` client, which provides the
@@ -158,6 +202,14 @@ impl ServerState {
             }
         }
 
+        if let Some(disk) = &self.disk {
+            if let Some(snapshot) = disk.load(name) {
+                let session = Arc::new(Session::restore(&snapshot)?);
+                self.insert(name, session.clone());
+                return Ok(Some(session));
+            }
+        }
+
         Ok(None)
     }
 
@@ -168,6 +220,15 @@ impl ServerState {
     ) -> Result<Result<Arc<Session>, Option<String>>> {
         if let Some(session) = self.lookup(name) {
             return Ok(Ok(session));
+        }
+
+        // Wake a sleeping board from disk before consulting the mesh.
+        if let Some(disk) = &self.disk {
+            if let Some(snapshot) = disk.load(name) {
+                let session = Arc::new(Session::restore(&snapshot)?);
+                self.insert(name, session.clone());
+                return Ok(Ok(session));
+            }
         }
 
         if let Some(mesh) = &self.mesh {
@@ -204,8 +265,8 @@ impl ServerState {
                 }
             }
             for name in to_close {
-                if let Err(err) = self.close_session(&name).await {
-                    error!(?err, "failed to close old session {name}");
+                if let Err(err) = self.evict_session(&name).await {
+                    error!(?err, "failed to evict old session {name}");
                 }
             }
         }

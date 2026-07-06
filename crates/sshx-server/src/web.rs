@@ -99,7 +99,42 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/sysstat", get(sysstat))
         .route("/files", get(list_files))
         .route("/file", get(read_file))
+        .route("/boards", get(list_boards))
         .route("/healthz", get(healthz))
+}
+
+/// Lobby listing: persisted boards (disk) merged with live in-memory sessions.
+async fn list_boards(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+) -> Response {
+    #[derive(serde::Serialize)]
+    struct BoardInfo {
+        name: String,
+        live: bool,
+        modified: Option<u64>,
+        size: Option<u64>,
+    }
+    let live: std::collections::HashSet<String> =
+        state.live_session_names().into_iter().collect();
+    let mut out: Vec<BoardInfo> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(disk) = state.disk() {
+        for b in disk.list() {
+            seen.insert(b.name.clone());
+            out.push(BoardInfo {
+                live: live.contains(&b.name),
+                name: b.name,
+                modified: Some(b.modified),
+                size: Some(b.size),
+            });
+        }
+    }
+    for name in live {
+        if !seen.contains(&name) {
+            out.push(BoardInfo { name, live: true, modified: None, size: None });
+        }
+    }
+    axum::Json(out).into_response()
 }
 
 async fn healthz(req: Request<Body>) -> Response {
