@@ -21,12 +21,17 @@ export type WsUser = {
  *  placeholder tile (no frame data); live frames arrive via StreamFrame. */
 export type BoardItem = {
   id: string;
-  kind: string; // "image" | "stream"
+  // "image" | "stream" | "video" | "note" | "job" | "roster" | "agent-request"
+  // | "link" | "doc" | "lock" | "label" — kept as bare `string`, not a union,
+  // so new kinds never need a protocol change. dataUrl is a JSON payload for
+  // every non-image/video kind (see round2-frontend-design.md for job/roster/
+  // agent-request's shapes).
+  kind: string;
   x: number;
   y: number;
   w: number;
   h: number;
-  dataUrl: string; // image data; empty for stream placeholders
+  dataUrl: string; // image data; JSON payload for non-media kinds; empty for stream placeholders
 };
 
 /** Server message type, see the Rust version. */

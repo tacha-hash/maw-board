@@ -41,7 +41,49 @@
     resize: { id: string; w: number; h: number };
     delete: string;
     edit: { id: string; text: string };
+    jobEdit: { id: string; prompt?: string; model?: string };
+    jobGenerate: string;
+    jobRetry: string;
   }>();
+
+  // ── Image-gen job node — dataUrl is a JSON payload, not raw text (see
+  // docs/round2-frontend-design.md). Parsed defensively like every other
+  // JSON-payload board item (link/lock precedent) since a malformed/partial
+  // dataUrl must never crash the render loop.
+  //
+  // Field names/values here MUST match tools/board-bridge.ts exactly (it's
+  // the live consumer, not a spec we control): `state`, not `status`; a
+  // *draft* job must carry an explicit `state: "draft"` — the bridge treats
+  // a MISSING state as immediately processable ("pending"-equivalent), so
+  // omitting it while the user is still typing would make the bridge start
+  // generating on every keystroke.
+  type JobState = "draft" | "pending" | "running" | "done" | "error";
+  type JobPayload = {
+    prompt: string;
+    model: string;
+    state: JobState;
+    error?: string;
+  };
+  // First entry matches the bridge's own fallback default (runKieJob's `m`).
+  const JOB_MODELS = ["nano-banana-pro", "flux-kontext", "imagen4", "seedream", "gpt-image"];
+  function parseJob(dataUrl: string): JobPayload {
+    try {
+      const parsed = JSON.parse(dataUrl);
+      const state: JobState = ["draft", "pending", "running", "done", "error"].includes(
+        parsed.state,
+      )
+        ? parsed.state
+        : "draft";
+      return {
+        prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
+        model: typeof parsed.model === "string" ? parsed.model : JOB_MODELS[0],
+        state,
+        error: typeof parsed.error === "string" ? parsed.error : undefined,
+      };
+    } catch {
+      return { prompt: "", model: JOB_MODELS[0], state: "draft" };
+    }
+  }
 
   // Resize state — drag the bottom-right handle to stretch a tile (like a window).
   const MIN_W = 120;
@@ -310,10 +352,82 @@
       class="board-item"
       class:is-stream={item.kind === "stream"}
       class:is-note={item.kind === "note"}
+      class:is-job={item.kind === "job"}
       style:width="{item.w}px"
       on:pointerdown={(event) => onPointerDown(event, item)}
     >
-      {#if item.kind === "note"}
+      {#if item.kind === "job"}
+        {@const job = parseJob(item.dataUrl)}
+        {@const editable = job.state === "draft"}
+        <div class="job-node" style:height="{item.h}px">
+          <div class="job-head">
+            <span class="job-title">🎨 Image Gen</span>
+            <select
+              class="job-model"
+              value={job.model}
+              disabled={hasWriteAccess === false || !editable}
+              on:pointerdown={(event) => event.stopPropagation()}
+              on:change={(event) =>
+                dispatch("jobEdit", {
+                  id: item.id,
+                  model: event.currentTarget.value,
+                })}
+            >
+              {#each JOB_MODELS as m}
+                <option value={m}>{m}</option>
+              {/each}
+            </select>
+          </div>
+          <textarea
+            class="job-prompt"
+            placeholder="Describe the image…"
+            value={job.prompt}
+            readonly={hasWriteAccess === false || !editable}
+            on:pointerdown={(event) => event.stopPropagation()}
+            on:input={(event) =>
+              dispatch("jobEdit", {
+                id: item.id,
+                prompt: event.currentTarget.value,
+              })}
+          />
+          <div class="job-footer">
+            {#if job.state === "pending"}
+              <span class="job-status">⏳ Queued — waiting for bridge…</span>
+            {:else if job.state === "running"}
+              <span class="job-status">🎨 Generating…</span>
+            {:else if job.state === "error"}
+              <span class="job-status job-status-error"
+                >⚠ {job.error ?? "Generation failed"}</span
+              >
+              <button
+                class="job-btn"
+                on:pointerdown={(event) => event.stopPropagation()}
+                on:click={() => dispatch("jobRetry", item.id)}
+              >
+                Retry
+              </button>
+            {:else if job.state === "done"}
+              <span class="job-status">✅ Done — see image on the board</span>
+              <button
+                class="job-btn"
+                on:pointerdown={(event) => event.stopPropagation()}
+                on:click={() => dispatch("jobRetry", item.id)}
+              >
+                Generate again
+              </button>
+            {:else}
+              <button
+                class="job-btn job-btn-primary"
+                disabled={hasWriteAccess === false || !job.prompt.trim()}
+                on:pointerdown={(event) => event.stopPropagation()}
+                on:click={() => dispatch("jobGenerate", item.id)}
+              >
+                ▶ Generate
+              </button>
+            {/if}
+          </div>
+        </div>
+      {:else if item.kind === "note"}
         <textarea
           class="note-text"
           style:height="{item.h}px"
@@ -456,6 +570,55 @@
     @apply block w-full p-3 bg-transparent resize-none outline-none border-0;
     @apply text-sm text-amber-950 placeholder-amber-700/50 font-medium leading-snug;
     cursor: text;
+  }
+
+  .board-item.is-job {
+    @apply ring-indigo-400/60 shadow-indigo-900/30;
+  }
+
+  .job-node {
+    @apply flex flex-col gap-2 p-2.5 bg-zinc-900 cursor-default;
+  }
+
+  .job-head {
+    @apply flex items-center justify-between gap-2;
+  }
+
+  .job-title {
+    @apply text-xs font-semibold text-zinc-300;
+  }
+
+  .job-model {
+    @apply text-[11px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 outline-none;
+    @apply ring-1 ring-zinc-700 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .job-prompt {
+    @apply flex-1 min-h-[100px] p-2 rounded-md bg-zinc-800/80 resize-none outline-none border-0;
+    @apply text-sm text-zinc-100 placeholder-zinc-500 leading-snug ring-1 ring-zinc-700;
+    @apply focus:ring-indigo-500;
+    cursor: text;
+  }
+
+  .job-footer {
+    @apply flex items-center gap-2 min-h-[28px];
+  }
+
+  .job-status {
+    @apply text-xs text-zinc-400 flex-1 truncate;
+  }
+
+  .job-status-error {
+    @apply text-red-400;
+  }
+
+  .job-btn {
+    @apply text-xs px-2.5 py-1 rounded-md bg-zinc-700/80 text-zinc-200 hover:bg-zinc-600;
+  }
+
+  .job-btn-primary {
+    @apply bg-indigo-600 text-white hover:bg-indigo-500 ml-auto;
+    @apply disabled:opacity-40 disabled:hover:bg-indigo-600 disabled:cursor-not-allowed;
   }
 
   .board-item img {

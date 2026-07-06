@@ -57,6 +57,8 @@
   import YouTubePopup from "./ui/YouTubePopup.svelte";
   import Avatars from "./ui/Avatars.svelte";
   import LiveCursor from "./ui/LiveCursor.svelte";
+  import ContextMenu from "./ui/ContextMenu.svelte";
+  import RosterSidebar from "./ui/RosterSidebar.svelte";
   import { slide } from "./action/slide";
   import { TouchZoom, INITIAL_ZOOM } from "./action/touchZoom";
   import { arrangeNewTerminal } from "./arrange";
@@ -104,6 +106,9 @@
   let showSnippets = false; // @hmr:keep
   let showYouTube = false; // @hmr:keep
   let showNumpad = false; // @hmr:keep
+  // Roster defaults open (unlike the other toggle-panels above) — it's the
+  // primary left nav per PLAN.md's round-2 spec, not an on-demand tool.
+  let showRoster = true; // @hmr:keep
 
   // Auto-hiding toolbar (Apple menu-bar style): fades out after inactivity,
   // reveals when the pointer nears the top edge or hovers it.
@@ -605,7 +610,7 @@
     pendingPortraitCreates = pending;
   }
 
-  async function handleCreate() {
+  async function handleCreate(pos?: [number, number]) {
     if (!canEdit) {
       makeToast({
         kind: "info",
@@ -622,13 +627,19 @@
       });
       return;
     }
-    const existing = shells.map(([id, winsize]) => ({
-      x: winsize.x,
-      y: winsize.y,
-      width: termWrappers[id].clientWidth,
-      height: termWrappers[id].clientHeight,
-    }));
-    const { x, y } = arrangeNewTerminal(existing);
+    let x: number, y: number;
+    if (pos) {
+      // Explicit placement (context-menu "New Terminal" at the click point).
+      [x, y] = pos;
+    } else {
+      const existing = shells.map(([id, winsize]) => ({
+        x: winsize.x,
+        y: winsize.y,
+        width: termWrappers[id].clientWidth,
+        height: termWrappers[id].clientHeight,
+      }));
+      ({ x, y } = arrangeNewTerminal(existing));
+    }
     rememberPendingPortraitCreate(x, y);
     srocket?.send({ create: [x, y] });
     touchZoom.moveTo([x, y], INITIAL_ZOOM);
@@ -1067,9 +1078,9 @@
   }
 
   // Add an editable sticky note to the board.
-  function addNote() {
+  function addNote(pos?: [number, number]) {
     if (!canEdit) return;
-    const [x, y] = nextBoardPos();
+    const [x, y] = pos ?? nextBoardPos();
     const item: BoardItem = {
       id: crypto.randomUUID(),
       kind: "note",
@@ -1081,6 +1092,200 @@
     };
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
+  }
+
+  // Add an image-gen node (PLAN.md round-2 spec): a "job" board item that
+  // starts as an editable draft (prompt + model). Pressing Generate flips
+  // its state to "pending" — that's the exact moment tools/board-bridge.ts
+  // (live since 2026-07-06) picks it up and runs Kie, per
+  // docs/round2-frontend-design.md. Field names/values here are the live
+  // bridge's contract, not ours to redesign — see parseJobPayload below.
+  function addJobNode(pos?: [number, number]) {
+    if (!canEdit) return;
+    const [x, y] = pos ?? nextBoardPos();
+    const item: BoardItem = {
+      id: crypto.randomUUID(),
+      kind: "job",
+      x,
+      y,
+      w: 300,
+      h: 320,
+      dataUrl: JSON.stringify({ prompt: "", model: "nano-banana-pro", state: "draft" }),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+  }
+
+  // Parses a "job" item's dataUrl — same defensive-parse pattern as
+  // linkEndpoints/boardLock (malformed/partial JSON must never throw here).
+  // IMPORTANT: the bridge treats a *missing* `state` as immediately
+  // processable (its guard is `payload.state && payload.state !== "pending"`)
+  // — so a draft MUST carry an explicit `state: "draft"`, never omit it,
+  // or the bridge starts generating on the very first keystroke.
+  function parseJobPayload(dataUrl: string): {
+    prompt: string;
+    model: string;
+    state: "draft" | "pending" | "running" | "done" | "error";
+    error?: string;
+  } {
+    try {
+      const p = JSON.parse(dataUrl);
+      const state = ["draft", "pending", "running", "done", "error"].includes(p.state)
+        ? p.state
+        : "draft";
+      return {
+        prompt: typeof p.prompt === "string" ? p.prompt : "",
+        model: typeof p.model === "string" ? p.model : "nano-banana-pro",
+        state,
+        error: typeof p.error === "string" ? p.error : undefined,
+      };
+    } catch {
+      return { prompt: "", model: "nano-banana-pro", state: "draft" };
+    }
+  }
+
+  // Prompt/model edits from the JobNode UI — only while still a draft, so a
+  // stray keystroke can't fight the bridge mid-generation.
+  function handleJobEdit(id: string, patch: { prompt?: string; model?: string }) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    if (job.state !== "draft") return;
+    const updated = { ...item, dataUrl: JSON.stringify({ ...job, ...patch }) };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  // The actual "post a job" moment per PLAN.md — bridge watches for
+  // state:"pending" job items, runs generation, and posts a sibling
+  // `<id>-out` image item + flips this item to state:"done" on completion.
+  function handleJobGenerate(id: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    if (!job.prompt.trim()) {
+      makeToast({ kind: "error", message: "Type a prompt first." });
+      return;
+    }
+    if (job.state === "pending" || job.state === "running") return;
+    const updated = {
+      ...item,
+      dataUrl: JSON.stringify({ ...job, state: "pending", error: undefined }),
+    };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  // Reset a job back to draft so the prompt is editable again — used both
+  // for "Retry" after an error and "Generate again" after done.
+  function handleJobRetry(id: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    const job = parseJobPayload(item.dataUrl);
+    const updated = {
+      ...item,
+      dataUrl: JSON.stringify({ ...job, state: "draft", error: undefined }),
+    };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  // ── Agent roster + agent-request (PLAN.md round-2 sidebar spec) ──────────
+  // The roster itself is a bridge-owned singleton (id:"roster", live since
+  // 2026-07-06) — read-only from here. Bridge sends `agents` as a bare
+  // string[] of names (see fleetRoster() in board-bridge.ts), so normalize
+  // each entry to {name} for RosterSidebar; tolerate an object shape too in
+  // case a future bridge version enriches it, per the same defensive-parse
+  // pattern as every other JSON-payload board item.
+  const ROSTER_ID = "roster";
+  $: rosterItem = boardItems.find((it) => it.id === ROSTER_ID);
+  $: roster = ((): { agents: { name: string; host?: string; status?: string }[] } => {
+    try {
+      if (!rosterItem?.dataUrl) return { agents: [] };
+      const parsed = JSON.parse(rosterItem.dataUrl);
+      const list = Array.isArray(parsed.agents) ? parsed.agents : [];
+      return {
+        agents: list.map((a: unknown) =>
+          typeof a === "string" ? { name: a } : (a as { name: string }),
+        ),
+      };
+    } catch {
+      return { agents: [] };
+    }
+  })();
+
+  // "Add to board" / "New agent" only ever post a request — spawning the
+  // actual mirror/terminal is the bridge's job (Le — board-bridge.ts).
+  function postAgentRequest(payload: Record<string, unknown>) {
+    if (!canEdit) return;
+    const item: BoardItem = {
+      id: `agent-request:${crypto.randomUUID()}`,
+      kind: "agent-request",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: JSON.stringify(payload),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+  }
+
+  function handleAddAgentToBoard(name: string) {
+    postAgentRequest({
+      action: "add",
+      name,
+      requestedBy: $settings.name || "someone",
+      ts: Date.now(),
+    });
+    makeToast({ kind: "success", message: `Requested: add ${name} to board` });
+  }
+
+  function handleCreateAgent(form: { name: string; host: string; repo: string }) {
+    if (!form.name.trim()) {
+      makeToast({ kind: "error", message: "Agent name required." });
+      return;
+    }
+    postAgentRequest({
+      action: "create",
+      name: form.name.trim(),
+      host: form.host.trim() || undefined,
+      repo: form.repo.trim() || undefined,
+      requestedBy: $settings.name || "someone",
+      ts: Date.now(),
+    });
+    makeToast({ kind: "success", message: `Requested: create agent ${form.name}` });
+  }
+
+  // ── Right-click "New Node" context menu ──────────────────────────────────
+  let contextMenu: {
+    screenX: number;
+    screenY: number;
+    worldX: number;
+    worldY: number;
+  } | null = null;
+
+  function openContextMenu(event: MouseEvent) {
+    // Only trigger on empty canvas background, not bubbled from a terminal
+    // or board tile (those get their own interactions, not this menu).
+    if (event.target !== event.currentTarget) return;
+    event.preventDefault();
+    if (!canEdit) {
+      makeToast({
+        kind: "info",
+        message: lockedForMe ? "Board is locked — read-only." : "Read-only — can't add nodes.",
+      });
+      return;
+    }
+    const [worldX, worldY] = normalizePosition(event);
+    contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
+  }
+
+  function closeContextMenu() {
+    contextMenu = null;
   }
 
   // Shared markdown document — a singleton board item synced to all peers
@@ -2051,16 +2256,18 @@
       {lockedForMe}
       {broadcastMode}
       numpadOpen={showNumpad}
-      on:create={handleCreate}
+      rosterOpen={showRoster}
+      on:create={() => handleCreate()}
       on:lock={toggleLock}
       on:broadcast={() => (broadcastMode = !broadcastMode)}
       on:snippets={() => (showSnippets = !showSnippets)}
       on:tile={({ detail }) => tileWindows(detail)}
       on:center={handleCenter}
       on:clear={handleClear}
-      on:note={addNote}
+      on:note={() => addNote()}
       on:video={handleVideoPick}
       on:files={() => (showExplorer = !showExplorer)}
+      on:roster={() => (showRoster = !showRoster)}
       on:numpad={() => (showNumpad = !showNumpad)}
       on:doc={() => (showDoc = !showDoc)}
       on:chat={() => {
@@ -2166,6 +2373,16 @@
     />
   {/if}
 
+  {#if showRoster}
+    <RosterSidebar
+      agents={roster.agents}
+      {canEdit}
+      on:close={() => (showRoster = false)}
+      on:addAgent={({ detail }) => handleAddAgentToBoard(detail)}
+      on:createAgent={({ detail }) => handleCreateAgent(detail)}
+    />
+  {/if}
+
   <SnippetBar
     open={showSnippets}
     on:paste={({ detail }) => pasteSnippet(detail)}
@@ -2262,7 +2479,11 @@
     </div>
   {/if}
 
-  <div class="absolute inset-0 overflow-hidden touch-none" bind:this={fabricEl}>
+  <div
+    class="absolute inset-0 overflow-hidden touch-none"
+    bind:this={fabricEl}
+    on:contextmenu={openContextMenu}
+  >
     <Board
       items={boardItems}
       {streamSrcs}
@@ -2282,7 +2503,24 @@
         handleBoardResize(detail.id, detail.w, detail.h)}
       on:delete={({ detail }) => handleBoardDelete(detail)}
       on:edit={({ detail }) => handleNoteEdit(detail.id, detail.text)}
+      on:jobEdit={({ detail }) => handleJobEdit(detail.id, detail)}
+      on:jobGenerate={({ detail }) => handleJobGenerate(detail)}
+      on:jobRetry={({ detail }) => handleJobRetry(detail)}
     />
+
+    {#if contextMenu}
+      {@const menu = contextMenu}
+      <ContextMenu
+        x={menu.screenX}
+        y={menu.screenY}
+        on:terminal={() => handleCreate([menu.worldX, menu.worldY])}
+        on:note={() => addNote([menu.worldX, menu.worldY])}
+        on:imageGen={() => addJobNode([menu.worldX, menu.worldY])}
+        on:meeting={() =>
+          makeToast({ kind: "info", message: "Meeting node — coming soon." })}
+        on:close={closeContextMenu}
+      />
+    {/if}
 
     {#if edgeSnapPreview}
       <div

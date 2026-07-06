@@ -25,6 +25,7 @@
     RadioIcon,
     SettingsIcon,
     TerminalIcon,
+    UsersIcon,
     VideoIcon,
     WifiIcon,
     YoutubeIcon,
@@ -40,6 +41,7 @@
   export let lockedForMe = false;
   export let broadcastMode = false;
   export let numpadOpen = false;
+  export let rosterOpen = false;
 
   const dispatch = createEventDispatcher<{
     create: void;
@@ -53,6 +55,7 @@
     video: void;
     files: void;
     numpad: void;
+    roster: void;
     doc: void;
     chat: void;
     settings: void;
@@ -196,6 +199,14 @@
         title="File explorer"
       >
         <FolderIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+      <button
+        class="icon-button"
+        class:active={rosterOpen}
+        on:click={() => dispatch("roster")}
+        title="Agent roster"
+      >
+        <UsersIcon strokeWidth={1.5} class="p-0.5" />
       </button>
       <button
         class="icon-button"
