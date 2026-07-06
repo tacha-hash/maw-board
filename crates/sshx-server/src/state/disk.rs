@@ -73,9 +73,12 @@ impl StorageDisk {
     }
 
     /// Remove a persisted snapshot (session closed permanently).
+    /// Also removes the escrowed key file, if any — key escrow follows the
+    /// board's lifecycle.
     pub fn delete(&self, name: &str) {
         if safe_name(name) {
             let _ = fs::remove_file(self.path_for(name));
+            let _ = fs::remove_file(self.dir.join(format!("{name}.key")));
         }
     }
 

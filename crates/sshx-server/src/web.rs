@@ -101,6 +101,7 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/file", get(read_file))
         .route("/boards", get(list_boards))
         .route("/boards/new", axum::routing::post(new_board))
+        .route("/boards/{name}", axum::routing::delete(delete_board))
         .route("/healthz", get(healthz))
 }
 
@@ -178,6 +179,19 @@ async fn new_board(
     // mint จาก server-wide mac แบบเดียวกับ Open() (tailnet-only จึงยอมรับได้ระดับนี้)
     let jt = crate::grpc::join_token(state.mac(), &name);
     axum::Json(serde_json::json!({ "name": name, "key": key, "join_token": jt })).into_response()
+}
+
+/// Permanently close and forget a board (memory + disk snapshot + key escrow).
+/// No auth beyond network position (tailnet-only), same posture as create/list;
+/// the frontend confirms before calling.
+async fn delete_board(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    match state.close_session(&name).await {
+        Ok(()) => (StatusCode::OK, "deleted").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Lobby listing: persisted boards (disk) merged with live in-memory sessions.
