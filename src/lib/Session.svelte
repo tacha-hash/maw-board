@@ -3077,6 +3077,11 @@
         {@const previewAnchorY = Math.min(fromY, toY)}
         {@const previewW = Math.max(Math.abs(toX - fromX), 1)}
         {@const previewH = Math.max(Math.abs(toY - fromY), 1)}
+        {@const px1 = fromX <= toX ? 0 : previewW}
+        {@const py1 = fromY <= toY ? 0 : previewH}
+        {@const px2 = fromX <= toX ? previewW : 0}
+        {@const py2 = fromY <= toY ? previewH : 0}
+        {@const pdx = Math.max(48, Math.abs(px2 - px1) / 2)}
         <div
           class="absolute pointer-events-none"
           style:left={OFFSET_LEFT_CSS}
@@ -3084,11 +3089,6 @@
           style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
           use:slide={{ x: previewAnchorX, y: previewAnchorY, center, zoom, immediate: true }}
         >
-          {@const px1 = fromX <= toX ? 0 : previewW}
-          {@const py1 = fromY <= toY ? 0 : previewH}
-          {@const px2 = fromX <= toX ? previewW : 0}
-          {@const py2 = fromY <= toY ? previewH : 0}
-          {@const pdx = Math.max(48, Math.abs(px2 - px1) / 2)}
           <svg width={previewW} height={previewH} style="overflow: visible;">
             <path
               d={`M ${px1} ${py1} C ${px1 + (px1 <= px2 ? pdx : -pdx)} ${py1}, ${px2 + (px1 <= px2 ? -pdx : pdx)} ${py2}, ${px2} ${py2}`}
