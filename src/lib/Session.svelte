@@ -1234,10 +1234,15 @@
     srocket?.send({ boardPut: item });
   }
 
+  // Field name here MUST be `agent`, not `name` — board-bridge.ts v2 reads
+  // `req.agent` (confirmed by reading its source directly), and doesn't
+  // check `action` at all — it treats every agent-request item as an add
+  // attempt. That's also why "remove" below posts no board item at all:
+  // one would get silently (mis)treated as another add attempt otherwise.
   function handleAddAgentToBoard(name: string) {
     postAgentRequest({
       action: "add",
-      name,
+      agent: name,
       requestedBy: $settings.name || "someone",
       ts: Date.now(),
     });
@@ -1248,7 +1253,7 @@
   // terminal labels (kind:"label", set by spawn-fleet-mirrors.ts/rename UI)
   // since there's no other per-shell "this is agent X" pointer today. Labels
   // are freeform ("secretary-oracle (agents:2)") so this is a substring
-  // match, same lenient approach as bin/pick-node.py's --find-name.
+  // match.
   $: mirroredAgents = new Set(
     roster.agents
       .map((a) => a.name)
@@ -1257,22 +1262,17 @@
       ),
   );
 
-  // Remove is a direct board action (close that shell), not just a request —
-  // the frontend already has everything needed (the shell's own id) via the
-  // existing sshx `close` protocol message, so there's no reason to wait on
-  // bridge v2 for this half like "Add" (which needs a process spawned).
+  // Remove is a direct board action (close that shell) — the frontend
+  // already has everything needed (the shell's own id) via the existing
+  // sshx `close` protocol message, no bridge involvement at all. Posts no
+  // agent-request item: bridge v2 doesn't check `action`, so a "remove"
+  // item would get misread as another add attempt (see comment above).
   function handleRemoveAgentFromBoard(name: string) {
     if (!canEdit) return;
     const match = shells.find(([sid]) => (labels[sid] ?? "").toLowerCase().includes(name.toLowerCase()));
     if (!match) return;
     const [sid] = match;
     srocket?.send({ close: sid });
-    postAgentRequest({
-      action: "remove",
-      name,
-      requestedBy: $settings.name || "someone",
-      ts: Date.now(),
-    });
     makeToast({ kind: "success", message: `Removed ${name} from board` });
   }
 
