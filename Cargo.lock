@@ -1978,7 +1978,9 @@ dependencies = [
 name = "sshx-server"
 version = "0.4.1"
 dependencies = [
+ "aes",
  "anyhow",
+ "argon2",
  "async-channel",
  "async-stream",
  "axum 0.8.1",
@@ -1986,6 +1988,7 @@ dependencies = [
  "bytes",
  "ciborium",
  "clap",
+ "ctr",
  "dashmap",
  "deadpool",
  "deadpool-redis",
@@ -1998,6 +2001,7 @@ dependencies = [
  "redis",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "sshx",
  "sshx-core",

@@ -100,7 +100,68 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/files", get(list_files))
         .route("/file", get(read_file))
         .route("/boards", get(list_boards))
+        .route("/boards/new", axum::routing::post(new_board))
         .route("/healthz", get(healthz))
+}
+
+/// KDF salt — must match the browser + CLI implementations exactly.
+const ENCRYPT_SALT: &str =
+    "This is a non-random salt for sshx.io, since we want to stretch the security of 83-bit keys!";
+
+/// Server-side computation of the encrypted-zeros block for a generated key,
+/// so empty boards can be created without any client. Mirrors
+/// `crates/sshx/src/encrypt.rs` (Argon2id 19MiB/2/1 → AES-128-CTR zero block).
+fn encrypted_zeros_for(key: &str) -> Vec<u8> {
+    use aes::cipher::{KeyIvInit, StreamCipher};
+    use argon2::{Algorithm, Argon2, Params, Version};
+    type Aes128Ctr64BE = ctr::Ctr64BE<aes::Aes128>;
+    let hasher = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(19 * 1024, 2, 1, Some(16)).unwrap(),
+    );
+    let mut aes_key = [0u8; 16];
+    hasher
+        .hash_password_into(key.as_bytes(), ENCRYPT_SALT.as_bytes(), &mut aes_key)
+        .expect("argon2 hashing failed");
+    let mut zeros = [0u8; 16];
+    let mut cipher = Aes128Ctr64BE::new(&aes_key.into(), &[0u8; 16].into());
+    cipher.apply_keystream(&mut zeros);
+    zeros.to_vec()
+}
+
+/// Create a new empty, persisted board without any backend client.
+/// Terminals attach later via multi-backend Join; notes/images/links work
+/// immediately. Returns the session name + encryption key so the frontend
+/// composes the URL from its own origin.
+async fn new_board(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    use crate::session::{Metadata, Session};
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let display_name = parsed
+        .as_ref()
+        .and_then(|b| b.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("board")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let key = sshx_core::rand_alphanumeric(14);
+    let name = sshx_core::rand_alphanumeric(10);
+    let metadata = Metadata {
+        encrypted_zeros: encrypted_zeros_for(&key).into(),
+        name: display_name,
+        write_password_hash: None,
+    };
+    let session = Arc::new(Session::new(metadata));
+    state.insert(&name, session.clone());
+    if let Some(disk) = state.disk() {
+        if let Ok(snapshot) = session.snapshot() {
+            let _ = disk.save(&name, &snapshot);
+        }
+    }
+    axum::Json(serde_json::json!({ "name": name, "key": key })).into_response()
 }
 
 /// Lobby listing: persisted boards (disk) merged with live in-memory sessions.
