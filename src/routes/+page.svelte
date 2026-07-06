@@ -1,342 +1,309 @@
+<!--
+  Lobby — replaces the original sshx CLI-install landing page (the fork is
+  fully independent now, PLAN.md 2026-07-06 ค่ำ; that content had no audience
+  here). "Board = Project" (PRODUCT SPEC point 5) makes this list the natural
+  root/home experience, not a secondary /lobby path — see
+  docs/lobby-ui-design.md (le-workboard) for the full reasoning, including
+  the localStorage key-recovery approach `GET /api/boards` architecturally
+  can't help with (the server never sees encryption keys at all).
+-->
 <script lang="ts">
+  import { onMount } from "svelte";
   import {
-    CastIcon,
-    DownloadIcon,
-    GitBranchIcon,
-    HardDriveIcon,
-    ImageIcon,
-    LockIcon,
-    PackageIcon,
+    PlusIcon,
     RefreshCwIcon,
-    Share2Icon,
+    FolderIcon,
+    ClockIcon,
+    KeyIcon,
   } from "svelte-feather-icons";
+  import { makeToast } from "$lib/toast";
 
-  import logotypeDark from "$lib/assets/logotype-dark.svg";
-  import landingGraphic from "$lib/assets/landing-graphic.svg";
-  import landingBackground from "$lib/assets/landing-background.svg";
-  import TeaserVideo from "$lib/ui/TeaserVideo.svelte";
-  import CopyableCode from "$lib/ui/CopyableCode.svelte";
-  import DownloadLink from "$lib/ui/DownloadLink.svelte";
+  type BoardInfo = { name: string; live: boolean; modified: number | null; size: number | null };
 
-  let installationEl: HTMLDivElement;
+  let boards: BoardInfo[] = [];
+  let loading = true;
+  let loadError = "";
 
-  const socials = [
-    {
-      title: "🤖\xa0 GitHub",
-      href: "https://github.com/ekzhang/sshx",
-    },
-    {
-      title: "🌸\xa0 Twitter",
-      href: "https://twitter.com/ekzhang1",
-    },
-    {
-      title: "💌\xa0 Email",
-      href: "mailto:ekzhang1@gmail.com",
-    },
-    {
-      title: "🌎\xa0 Website",
-      href: "https://www.ekzhang.com",
-    },
-  ];
+  const KEY_STORAGE = "oracle-board-keys";
 
-  function scrollToInstallation() {
-    installationEl.scrollIntoView({ behavior: "smooth" });
+  function loadKeyMap(): Record<string, string> {
+    try {
+      return JSON.parse(localStorage.getItem(KEY_STORAGE) ?? "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function saveKey(name: string, key: string) {
+    const map = loadKeyMap();
+    map[name] = key;
+    localStorage.setItem(KEY_STORAGE, JSON.stringify(map));
+  }
+
+  async function loadBoards() {
+    loading = true;
+    loadError = "";
+    try {
+      const res = await fetch("/api/boards");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      // Newest/live first — most likely what you want to jump back into.
+      boards = (data as BoardInfo[]).sort((a, b) => {
+        if (a.live !== b.live) return a.live ? -1 : 1;
+        return (b.modified ?? 0) - (a.modified ?? 0);
+      });
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : "failed to load";
+    } finally {
+      loading = false;
+    }
+  }
+
+  onMount(loadBoards);
+
+  function relativeTime(unixSecs: number | null, live: boolean): string {
+    // `modified` is null for a live session with no disk snapshot yet — for
+    // a non-live board this shouldn't really happen, but "active now" would
+    // be actively misleading in that case, so don't assume liveness from it.
+    if (unixSecs === null) return live ? "active now" : "no activity recorded";
+    const diffMs = Date.now() - unixSecs * 1000;
+    const mins = Math.floor(diffMs / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+  }
+
+  // "Open" needs the board's encryption key, which the server never has
+  // (E2E — keys live only in the URL fragment). Boards this lobby created
+  // have it in localStorage already; anything else (a board from before
+  // the lobby existed, or opened from a different browser) needs a manual
+  // paste — see docs/lobby-ui-design.md.
+  let pendingOpenName: string | null = null;
+  let manualKeyInput = "";
+
+  function keyFor(name: string): string | undefined {
+    return loadKeyMap()[name];
+  }
+
+  function openWithKey(name: string, key: string) {
+    window.location.href = `${window.location.origin}/s/${name}#${key}`;
+  }
+
+  function requestManualKey(name: string) {
+    pendingOpenName = name;
+    manualKeyInput = "";
+  }
+
+  function submitManualKey() {
+    if (!pendingOpenName || !manualKeyInput.trim()) return;
+    let key = manualKeyInput.trim();
+    const hashIdx = key.indexOf("#");
+    if (hashIdx >= 0) key = key.slice(hashIdx + 1);
+    saveKey(pendingOpenName, key);
+    openWithKey(pendingOpenName, key);
+  }
+
+  let showNewForm = false;
+  let newBoardName = "";
+  let creating = false;
+
+  async function createBoard() {
+    creating = true;
+    try {
+      const res = await fetch("/api/boards/new", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newBoardName.trim() ? { name: newBoardName.trim() } : {}),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const { name, key } = await res.json();
+      saveKey(name, key);
+      openWithKey(name, key);
+    } catch (e) {
+      makeToast({
+        kind: "error",
+        message: `Couldn't create board: ${e instanceof Error ? e.message : "unknown error"}`,
+      });
+    } finally {
+      creating = false;
+    }
   }
 </script>
 
-<main
-  class="max-w-screen-xl mx-auto px-4 md:px-8 lg:px-16 text-zinc-100 overflow-x-hidden"
->
-  <header class="mt-6 mb-4 sm:my-8 md:my-12">
-    <img class="h-12 sm:h-16 -mx-1" src={logotypeDark} alt="sshx logo" />
-  </header>
-  <h1
-    class="font-medium text-3xl sm:text-4xl md:text-5xl max-w-[26ch] py-2 mb-6 md:mb-0 sm:tracking-tight leading-[1.15]"
-  >
-    A secure web-based,
-    <span class="title-gradient">collaborative</span> terminal
-  </h1>
+<svelte:head>
+  <title>Oracle Board</title>
+</svelte:head>
 
-  <div class="relative">
-    <div
-      class="absolute scale-150 md:scale-100 md:left-[180px] md:top-[-200px] md:w-[1000px] -z-10"
-    >
-      <img class="select-none" src={landingBackground} alt="" />
+<!-- <svelte:window> must be at the template's top level, not nested inside
+     an {#if} — Escape only matters while the modal is open, guarded here. -->
+<svelte:window
+  on:keydown={(e) => e.key === "Escape" && pendingOpenName && (pendingOpenName = null)}
+/>
+
+<main class="lobby">
+  <div class="lobby-head">
+    <h1>Oracle Board</h1>
+    <div class="head-actions">
+      <button class="icon-btn" title="Refresh" on:click={loadBoards} disabled={loading}>
+        <RefreshCwIcon size="16" class={loading ? "spin" : ""} />
+      </button>
+      <button class="new-board-btn" on:click={() => (showNewForm = !showNewForm)}>
+        <PlusIcon size="16" />
+        New Board
+      </button>
     </div>
-    <div class="md:absolute md:left-[500px] md:w-[1000px]">
-      <img
-        class="mt-5 mb-8 w-[720px]"
-        width={813}
-        height={623}
-        src={landingGraphic}
-        alt="two terminal windows running sshx and three live cursors"
+  </div>
+
+  {#if showNewForm}
+    <div class="new-form panel">
+      <input
+        class="field"
+        placeholder="Board name (optional — random if left blank)"
+        bind:value={newBoardName}
+        on:keydown={(e) => e.key === "Enter" && createBoard()}
       />
+      <button class="btn" on:click={() => (showNewForm = false)}>Cancel</button>
+      <button class="btn btn-primary" disabled={creating} on:click={createBoard}>
+        {creating ? "Creating…" : "Create"}
+      </button>
     </div>
-  </div>
+  {/if}
 
-  <section class="my-12 space-y-6 sm:text-lg md:max-w-[460px] text-zinc-400">
-    <p>
-      <code class="name">sshx</code> lets you share your terminal with anyone by
-      link, on a
-      <b>multiplayer infinite canvas</b>.
-    </p>
-    <p>
-      It has <b>real-time collaboration</b>, with remote cursors and chat. It's
-      also <b>fast</b> and <b>end-to-end encrypted</b>, with a lightweight
-      server written in Rust.
-    </p>
-    <p>
-      Install <code class="name">sshx</code> with a single command. Use it for teaching,
-      debugging, or cloud access.
-    </p>
-  </section>
+  {#if loading}
+    <p class="muted">Loading boards…</p>
+  {:else if loadError}
+    <p class="error-text">Couldn't load boards: {loadError}</p>
+  {:else if boards.length === 0}
+    <p class="muted">No boards yet — create one to get started.</p>
+  {:else}
+    <div class="board-list">
+      {#each boards as board (board.name)}
+        <div class="board-row panel">
+          <span class="dot" class:live={board.live} title={board.live ? "Live" : "Sleeping"} />
+          <span class="board-name">{board.name}</span>
+          <span class="board-meta">
+            <ClockIcon size="12" />
+            {relativeTime(board.modified, board.live)}
+          </span>
+          {#if keyFor(board.name)}
+            <button class="open-btn" on:click={() => openWithKey(board.name, keyFor(board.name) ?? "")}>
+              <FolderIcon size="14" />
+              Open
+            </button>
+          {:else}
+            <button class="open-btn open-btn-secondary" on:click={() => requestManualKey(board.name)}>
+              <KeyIcon size="14" />
+              Need key
+            </button>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
 
-  <div class="pb-12 md:pb-36">
-    <button
-      class="bg-pink-700 hover:bg-pink-600 active:ring-4 active:ring-pink-500/50 text-lg font-medium px-8 py-2 rounded-full"
-      on:click={scrollToInstallation}
+  {#if pendingOpenName}
+    <div
+      class="modal-backdrop"
+      role="button"
+      tabindex="0"
+      on:click={() => (pendingOpenName = null)}
+      on:keydown={(e) => e.key === "Enter" && (pendingOpenName = null)}
     >
-      Get Started
-    </button>
-  </div>
-
-  <div class="mt-8 md:mt-32 grid md:grid-cols-2 xl:grid-cols-3 gap-4 md:gap-6">
-    <div class="feature-block">
-      <div class="feature-icon">
-        <CastIcon size="14" />
-      </div>
-      <h3>Collaborative</h3>
-      <p>Invite people by sharing a secure, unique browser link.</p>
-    </div>
-    <div class="feature-block">
-      <div class="feature-icon">
-        <LockIcon size="14" />
-      </div>
-      <h3>End-to-end encrypted</h3>
-      <p>Send data securely; the server never sees what you're typing.</p>
-    </div>
-    <div class="feature-block">
-      <div class="feature-icon">
-        <HardDriveIcon size="14" />
-      </div>
-      <h3>Cross-platform</h3>
-      <p>Use the command-line tool on macOS, Linux, and Windows.</p>
-    </div>
-    <div class="feature-block">
-      <div class="feature-icon">
-        <ImageIcon size="14" />
-      </div>
-      <h3>Infinite canvas</h3>
-      <p>Move and resize multiple terminals at once, in any arrangement.</p>
-    </div>
-    <div class="feature-block">
-      <div class="feature-icon">
-        <RefreshCwIcon size="14" />
-      </div>
-      <h3>Live presence</h3>
-      <p>See other people's names and cursors within the app.</p>
-    </div>
-    <div class="feature-block">
-      <div class="feature-icon">
-        <Share2Icon size="14" />
-      </div>
-      <h3>Ultra-fast mesh networking</h3>
-      <p>
-        Connect from anywhere to the nearest distributed peer in a global
-        network.
-      </p>
-    </div>
-  </div>
-
-  <div class="my-48 hidden md:block">
-    <TeaserVideo />
-  </div>
-
-  <h2
-    bind:this={installationEl}
-    class="mt-32 mb-12 font-medium text-3xl sm:text-4xl md:text-center scroll-mt-16"
-  >
-    Installation
-  </h2>
-
-  <section class="installation-section">
-    <h3 class="text-xl sm:text-lg">
-      <DownloadIcon size="20" class="text-zinc-400 inline-block mr-1 mb-0.5" />
-      macOS / Linux
-    </h3>
-    <div class="text-sm text-zinc-400 md:text-base md:pt-0.5">
-      <p class="mb-3">Run the following in your terminal:</p>
-      <CopyableCode value="curl -sSf https://sshx.io/get | sh" />
-
-      <p class="mt-8 mb-3">Or, download the binary for your platform.</p>
-      <div class="flex flex-wrap gap-2 mb-2">
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-aarch64-apple-darwin.tar.gz"
-          >macOS ARM64 (Apple Silicon)</DownloadLink
-        >
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-x86_64-apple-darwin.tar.gz"
-          >macOS x86-64 (Intel)</DownloadLink
-        >
-      </div>
-      <div class="flex flex-wrap gap-2 mb-2">
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-aarch64-unknown-linux-musl.tar.gz"
-          >Linux ARM64</DownloadLink
-        >
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-x86_64-unknown-linux-musl.tar.gz"
-          >Linux x86-64</DownloadLink
-        >
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-arm-unknown-linux-musleabihf.tar.gz"
-          >Linux ARMv6</DownloadLink
-        >
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-armv7-unknown-linux-musleabihf.tar.gz"
-          >Linux ARMv7</DownloadLink
-        >
-      </div>
-      <div class="flex flex-wrap gap-2">
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-x86_64-unknown-freebsd.tar.gz"
-          >FreeBSD x86-64</DownloadLink
-        >
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <div class="modal panel" on:click={(e) => e.stopPropagation()}>
+        <p>No key remembered on this device for <strong>{pendingOpenName}</strong>.</p>
+        <p class="muted">Paste the full board URL, or just the key after the #.</p>
+        <input
+          class="field"
+          placeholder="https://.../s/name#key or just the key"
+          bind:value={manualKeyInput}
+          on:keydown={(e) => e.key === "Enter" && submitManualKey()}
+        />
+        <div class="modal-actions">
+          <button class="btn" on:click={() => (pendingOpenName = null)}>Cancel</button>
+          <button class="btn btn-primary" disabled={!manualKeyInput.trim()} on:click={submitManualKey}>
+            Open
+          </button>
+        </div>
       </div>
     </div>
-  </section>
-
-  <section class="installation-section">
-    <h3 class="text-xl sm:text-lg">
-      <DownloadIcon size="20" class="text-zinc-400 inline-block mr-1 mb-0.5" />
-      Windows
-    </h3>
-    <div class="text-sm text-zinc-400 md:text-base md:pt-0.5">
-      <p class="mb-3">Download the executable for your platform.</p>
-
-      <div class="flex flex-wrap gap-2">
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-x86_64-pc-windows-msvc.zip"
-          >Windows x86-64</DownloadLink
-        >
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-i686-pc-windows-msvc.zip"
-          >Windows x86</DownloadLink
-        >
-        <DownloadLink
-          href="https://sshx.s3.amazonaws.com/sshx-aarch64-pc-windows-msvc.zip"
-          >Windows ARM64</DownloadLink
-        >
-      </div>
-    </div>
-  </section>
-
-  <section class="installation-section">
-    <h3 class="text-xl sm:text-lg">
-      <PackageIcon size="20" class="text-zinc-400 inline-block mr-1 mb-0.5" />
-      Build from source
-    </h3>
-    <div class="text-sm text-zinc-400 md:text-base md:pt-0.5">
-      <p class="mb-3">
-        Ensure you have up-to-date versions of Rust and protoc. Compile sshx and
-        add it to the system path.
-      </p>
-      <CopyableCode value="cargo install sshx" />
-    </div>
-  </section>
-
-  <section class="installation-section">
-    <h3 class="text-xl sm:text-lg">
-      <GitBranchIcon size="20" class="text-zinc-400 inline-block mr-1 mb-0.5" />
-      GitHub Actions
-    </h3>
-    <div class="text-sm text-zinc-400 md:text-base md:pt-0.5">
-      <p class="mb-3">
-        On GitHub Actions or other CI providers, run this command. It pauses
-        your workflow and starts a collaborative session.
-      </p>
-      <CopyableCode value="curl -sSf https://sshx.io/get | sh -s run" />
-    </div>
-  </section>
-
-  <hr class="mt-32 mb-12" />
-
-  <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-6">
-    {#each socials as social}
-      <a
-        target="_blank"
-        rel="noreferrer"
-        href={social.href}
-        class="border border-white/10 hover:border-white/30 transition-colors p-4 text-center text-lg font-medium rounded-lg"
-      >
-        {social.title}
-      </a>
-    {/each}
-  </div>
-
-  <p class="mb-12 text-center text-zinc-400">
-    open source, &copy; Eric Zhang 2023
-  </p>
+  {/if}
 </main>
 
 <style lang="postcss">
-  b {
-    @apply text-zinc-300 font-medium;
+  .lobby {
+    @apply max-w-2xl mx-auto p-8 text-zinc-200;
   }
-
-  code.name {
-    @apply text-[0.9em] text-zinc-100 border border-white/25 px-1 py-0.5 rounded;
+  .lobby-head {
+    @apply flex items-center justify-between mb-6;
   }
-
-  hr {
-    @apply mx-auto md:w-1/2 border-zinc-800;
+  h1 {
+    @apply text-2xl font-semibold;
   }
-
-  .title-gradient {
-    @apply text-transparent bg-clip-text bg-gradient-to-r from-fuchsia-400 to-blue-500;
+  .head-actions {
+    @apply flex items-center gap-2;
   }
-
-  .feature-block {
-    @apply relative border rounded-lg border-transparent p-6 sm:p-8;
-    background: #111111 padding-box;
+  .icon-btn {
+    @apply p-2 rounded-md bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50;
   }
-
-  .feature-block::before {
-    content: "";
-    @apply absolute inset-0;
-    z-index: -1;
-    margin: -1px;
-    border-radius: inherit;
-    background: linear-gradient(
-      160deg,
-      rgba(255, 255, 255, 0.36) 5%,
-      rgba(255, 255, 255, 0.08) 25%,
-      rgba(255, 255, 255, 0.24) 50%,
-      rgba(255, 255, 255, 0.08) 75%,
-      rgba(255, 255, 255, 0.28) 95%
-    );
-    opacity: 0.5;
-    transition: opacity 200ms;
+  :global(.icon-btn .spin) {
+    @apply animate-spin;
   }
-
-  .feature-block:hover::before {
-    opacity: 1;
+  .new-board-btn {
+    @apply flex items-center gap-1.5 px-3 py-2 rounded-md bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-500;
   }
-
-  .feature-block h3 {
-    @apply font-medium mb-2;
+  .new-form {
+    @apply flex gap-2 p-3 mb-4;
   }
-
-  .feature-block p {
-    @apply text-zinc-400;
+  .field {
+    @apply flex-1 px-3 py-1.5 rounded bg-zinc-800 text-sm text-zinc-100 outline-none ring-1 ring-zinc-700 focus:ring-indigo-500;
   }
-
-  .feature-icon {
-    @apply inline-block p-3 rounded-full mb-3 shadow-md border border-zinc-600;
+  .btn {
+    @apply px-3 py-1.5 rounded text-sm text-zinc-300 hover:bg-white/10;
   }
-
-  .installation-section {
-    @apply grid sm:grid-cols-[200px,1fr] gap-x-10 gap-y-4 max-w-4xl mx-auto sm:border-t sm:border-white/10 sm:py-6 lg:px-2;
-    @apply mb-16 lg:mb-8;
+  .btn-primary {
+    @apply bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600;
+  }
+  .muted {
+    @apply text-zinc-500 text-sm;
+  }
+  .error-text {
+    @apply text-red-400 text-sm;
+  }
+  .board-list {
+    @apply flex flex-col gap-2;
+  }
+  .board-row {
+    @apply flex items-center gap-3 px-4 py-3;
+  }
+  .dot {
+    @apply w-2.5 h-2.5 rounded-full bg-zinc-600 flex-none;
+  }
+  .dot.live {
+    @apply bg-emerald-400;
+  }
+  .board-name {
+    @apply flex-1 min-w-0 truncate font-medium;
+  }
+  .board-meta {
+    @apply flex items-center gap-1 text-xs text-zinc-500 flex-none;
+  }
+  .open-btn {
+    @apply flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-700/80 text-zinc-100 text-sm;
+    @apply hover:bg-indigo-600 flex-none;
+  }
+  .open-btn-secondary {
+    @apply bg-zinc-800 text-zinc-400 hover:bg-amber-600 hover:text-white;
+  }
+  .modal-backdrop {
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4;
+  }
+  .modal {
+    @apply flex flex-col gap-2 p-5 max-w-md w-full;
+  }
+  .modal-actions {
+    @apply flex justify-end gap-2 mt-1;
   }
 </style>
