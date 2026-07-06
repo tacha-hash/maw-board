@@ -2982,13 +2982,15 @@
           {@const elA = termWrappers[link.a]}
           {@const elB = termWrappers[link.b]}
           {@const centerAx = wsA.x + (elA?.offsetWidth ?? 0) / 2}
-          {@const centerAy = wsA.y + (elA?.offsetHeight ?? 0) / 2}
           {@const centerBx = wsB.x + (elB?.offsetWidth ?? 0) / 2}
-          {@const centerBy = wsB.y + (elB?.offsetHeight ?? 0) / 2}
-          {@const edgeA = clipToBoxEdge(centerAx, centerAy, (elA?.offsetWidth ?? 0) / 2, (elA?.offsetHeight ?? 0) / 2, centerBx - centerAx, centerBy - centerAy)}
-          {@const edgeB = clipToBoxEdge(centerBx, centerBy, (elB?.offsetWidth ?? 0) / 2, (elB?.offsetHeight ?? 0) / 2, centerAx - centerBx, centerAy - centerBy)}
-          {@const [pointAx, pointAy] = edgeA}
-          {@const [pointBx, pointBy] = edgeB}
+          {@const aIsLeft = centerAx <= centerBx}
+          <!-- ComfyUI-style port anchoring (Louis: เส้นต้องออกจากรู ⊙ เป๊ะ):
+               สายออกจากพอร์ตขวา-กลางของ node ฝั่งซ้าย เข้าที่ขอบซ้าย-กลาง
+               ของ node ฝั่งขวาเสมอ — ไม่ใช่ขอบที่ใกล้สุดแบบเดิม -->
+          {@const pointAx = aIsLeft ? wsA.x + (elA?.offsetWidth ?? 0) : wsA.x}
+          {@const pointAy = wsA.y + (elA?.offsetHeight ?? 0) / 2}
+          {@const pointBx = aIsLeft ? wsB.x : wsB.x + (elB?.offsetWidth ?? 0)}
+          {@const pointBy = wsB.y + (elB?.offsetHeight ?? 0) / 2}
           {@const anchorX = Math.min(pointAx, pointBx)}
           {@const anchorY = Math.min(pointAy, pointBy)}
           {@const lineW = Math.max(Math.abs(pointBx - pointAx), 1)}
