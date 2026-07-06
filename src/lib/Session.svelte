@@ -262,6 +262,82 @@
     }
   }
 
+  // ── Node-based drag-to-connect (link between two terminals) ──
+  // A link is just another BoardItem (kind:"link"), so it rides the same
+  // idempotent broadcast + snapshot persistence as every other board item —
+  // no protocol change needed. See docs/phase3b-node-link.md.
+
+  /** Deterministic, order-independent id for a link between two shells. */
+  function linkId(a: number, b: number): string {
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    return `link:${lo}:${hi}`;
+  }
+
+  /** Create (or idempotently re-put) a link between two shells. */
+  function createLink(a: number, b: number) {
+    if (!canEdit || a === b) return;
+    const item: BoardItem = {
+      id: linkId(a, b),
+      kind: "link",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: JSON.stringify({ a, b }),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+  }
+
+  /** Remove a link by its two endpoints (the unlink gesture). */
+  function removeLink(a: number, b: number) {
+    if (!canEdit) return;
+    const id = linkId(a, b);
+    removeBoardItem(id);
+    srocket?.send({ boardDelete: id });
+  }
+
+  /** Parse a link board item's endpoints, or null if not a (valid) link. */
+  function linkEndpoints(item: BoardItem): { a: number; b: number } | null {
+    if (item.kind !== "link") return null;
+    try {
+      const parsed = JSON.parse(item.dataUrl);
+      if (typeof parsed.a === "number" && typeof parsed.b === "number") {
+        return { a: parsed.a, b: parsed.b };
+      }
+    } catch {
+      // malformed dataUrl — ignore
+    }
+    return null;
+  }
+
+  /** After a terminal drag ends, link it to any other terminal it now
+   *  overlaps (axis-aligned bounding box test in world space — `offsetWidth`
+   *  /`offsetHeight` are already world units here since the zoom transform
+   *  is paint-only, same assumption `computeSnap` above already relies on). */
+  function checkLinkOverlap(movedId: number) {
+    const movedEl = termWrappers[movedId];
+    if (!movedEl) return;
+    const moved = {
+      x: movingSize.x,
+      y: movingSize.y,
+      w: movedEl.offsetWidth,
+      h: movedEl.offsetHeight,
+    };
+    for (const [otherId, ws] of shells) {
+      if (otherId === movedId) continue;
+      const otherEl = termWrappers[otherId];
+      if (!otherEl) continue;
+      const other = { x: ws.x, y: ws.y, w: otherEl.offsetWidth, h: otherEl.offsetHeight };
+      const overlap =
+        moved.x < other.x + other.w &&
+        moved.x + moved.w > other.x &&
+        moved.y < other.y + other.h &&
+        moved.y + moved.h > other.y;
+      if (overlap) createLink(movedId, otherId);
+    }
+  }
+
   /** Update the live frame shown for a stream tile. */
   function setStreamFrame(id: string, bytes: Uint8Array) {
     const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
@@ -831,6 +907,7 @@
           void applySnap(moving, edgeSnap.action, false, { cycle: false });
         } else {
           srocket?.send({ move: [moving, movingSize] });
+          if (mayEdgeSnap) checkLinkOverlap(moving);
         }
         edgeSnapPreview = null;
         pendingEdgeSnap = null;
@@ -2224,6 +2301,62 @@
         }}
       />
     {/if}
+
+    <!-- Node-based drag-to-connect: link lines render UNDER the terminals
+         they connect (document order = z-order here), so they read as
+         cables plugging into the windows rather than obscuring them. -->
+    {#each boardItems as item (item.id)}
+      {@const link = linkEndpoints(item)}
+      {#if link}
+        {@const shellA = shells.find(([sid]) => sid === link.a)}
+        {@const shellB = shells.find(([sid]) => sid === link.b)}
+        {#if shellA && shellB}
+          {@const wsA = link.a === moving ? movingSize : shellA[1]}
+          {@const wsB = link.b === moving ? movingSize : shellB[1]}
+          {@const elA = termWrappers[link.a]}
+          {@const elB = termWrappers[link.b]}
+          {@const centerAx = wsA.x + (elA?.offsetWidth ?? 0) / 2}
+          {@const centerAy = wsA.y + (elA?.offsetHeight ?? 0) / 2}
+          {@const centerBx = wsB.x + (elB?.offsetWidth ?? 0) / 2}
+          {@const centerBy = wsB.y + (elB?.offsetHeight ?? 0) / 2}
+          {@const anchorX = Math.min(centerAx, centerBx)}
+          {@const anchorY = Math.min(centerAy, centerBy)}
+          {@const lineW = Math.max(Math.abs(centerBx - centerAx), 1)}
+          {@const lineH = Math.max(Math.abs(centerBy - centerAy), 1)}
+          <div
+            class="absolute pointer-events-none"
+            style:left={OFFSET_LEFT_CSS}
+            style:top={OFFSET_TOP_CSS}
+            style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+            use:slide={{ x: anchorX, y: anchorY, center, zoom, immediate: true }}
+          >
+            <svg width={lineW} height={lineH} style="overflow: visible;">
+              <line
+                x1={centerAx <= centerBx ? 0 : lineW}
+                y1={centerAy <= centerBy ? 0 : lineH}
+                x2={centerAx <= centerBx ? lineW : 0}
+                y2={centerAy <= centerBy ? lineH : 0}
+                stroke="#818cf8"
+                stroke-width="3"
+                stroke-dasharray="8 6"
+              />
+            </svg>
+            {#if canEdit}
+              <button
+                class="pointer-events-auto absolute flex h-5 w-5 items-center justify-center rounded-full bg-indigo-500 text-xs text-white shadow hover:bg-red-500"
+                style:left={`${lineW / 2 - 10}px`}
+                style:top={`${lineH / 2 - 10}px`}
+                title="Unlink"
+                on:pointerdown={(e) => e.stopPropagation()}
+                on:click={() => removeLink(link.a, link.b)}
+              >
+                ✕
+              </button>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+    {/each}
 
     {#each shells as [id, winsize] (id)}
       {@const ws = id === moving ? movingSize : winsize}

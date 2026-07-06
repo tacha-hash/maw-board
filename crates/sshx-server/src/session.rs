@@ -35,6 +35,19 @@ const MAX_BOARD_KIND_LEN: usize = 64;
 const MIN_BOARD_DIM: u32 = 1;
 const MAX_BOARD_DIM: u32 = 16_384;
 
+/// Board item kinds that are actual sized, rendered tiles (images, notes,
+/// etc.) — these must meet the minimum-dimension floor below. Everything
+/// else is a non-visual "sentinel" item (rename labels, board-lock markers,
+/// shared-doc pointers, node-links) that legitimately uses w:0,h:0
+/// client-side since it's never rendered as a sized tile at all — see
+/// Session.svelte's handleRename/lock/doc code. Enforcing the size floor
+/// unconditionally silently rejected every one of those board_put calls
+/// (pre-existing bug in the base fork's P1 bounds validation, found while
+/// adding link items which hit the exact same rejection).
+fn kind_has_rendered_size(kind: &str) -> bool {
+    matches!(kind, "image" | "video" | "note" | "stream")
+}
+
 pub(crate) fn validate_board_item(item: &BoardItem) -> Result<()> {
     use anyhow::ensure;
     ensure!(!item.id.is_empty(), "board item id empty");
@@ -46,10 +59,12 @@ pub(crate) fn validate_board_item(item: &BoardItem) -> Result<()> {
         item.kind.len() <= MAX_BOARD_KIND_LEN,
         "board item kind too long (max {MAX_BOARD_KIND_LEN})"
     );
-    ensure!(
-        item.w >= MIN_BOARD_DIM && item.h >= MIN_BOARD_DIM,
-        "board item dimensions too small (min {MIN_BOARD_DIM})"
-    );
+    if kind_has_rendered_size(&item.kind) {
+        ensure!(
+            item.w >= MIN_BOARD_DIM && item.h >= MIN_BOARD_DIM,
+            "board item dimensions too small (min {MIN_BOARD_DIM})"
+        );
+    }
     ensure!(
         item.w <= MAX_BOARD_DIM && item.h <= MAX_BOARD_DIM,
         "board item dimensions too large (max {MAX_BOARD_DIM})"
