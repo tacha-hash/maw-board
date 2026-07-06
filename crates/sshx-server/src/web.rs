@@ -156,9 +156,22 @@ async fn new_board(
     };
     let session = Arc::new(Session::new(metadata));
     state.insert(&name, session.clone());
+    let jt_for_escrow = crate::grpc::join_token(state.mac(), &name);
     if let Some(disk) = state.disk() {
         if let Ok(snapshot) = session.snapshot() {
             let _ = disk.save(&name, &snapshot);
+        }
+        // Key escrow for server-created boards (the server generated this key
+        // anyway): lets the local bridge daemon auto-join every lobby-created
+        // board. 0600, same-user, tailnet-local box — accepted tradeoff.
+        let key_path = disk.dir().join(format!("{name}.key"));
+        let payload = serde_json::json!({ "key": key, "join_token": jt_for_escrow }).to_string();
+        if std::fs::write(&key_path, payload).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
         }
     }
     // join_token ให้ backend (agent host) เข้ามา Join บอร์ดนี้ทีหลังได้ —
