@@ -1244,6 +1244,38 @@
     makeToast({ kind: "success", message: `Requested: add ${name} to board` });
   }
 
+  // Which roster agents currently have a mirror shell open — matched against
+  // terminal labels (kind:"label", set by spawn-fleet-mirrors.ts/rename UI)
+  // since there's no other per-shell "this is agent X" pointer today. Labels
+  // are freeform ("secretary-oracle (agents:2)") so this is a substring
+  // match, same lenient approach as bin/pick-node.py's --find-name.
+  $: mirroredAgents = new Set(
+    roster.agents
+      .map((a) => a.name)
+      .filter((name) =>
+        shells.some(([sid]) => (labels[sid] ?? "").toLowerCase().includes(name.toLowerCase())),
+      ),
+  );
+
+  // Remove is a direct board action (close that shell), not just a request —
+  // the frontend already has everything needed (the shell's own id) via the
+  // existing sshx `close` protocol message, so there's no reason to wait on
+  // bridge v2 for this half like "Add" (which needs a process spawned).
+  function handleRemoveAgentFromBoard(name: string) {
+    if (!canEdit) return;
+    const match = shells.find(([sid]) => (labels[sid] ?? "").toLowerCase().includes(name.toLowerCase()));
+    if (!match) return;
+    const [sid] = match;
+    srocket?.send({ close: sid });
+    postAgentRequest({
+      action: "remove",
+      name,
+      requestedBy: $settings.name || "someone",
+      ts: Date.now(),
+    });
+    makeToast({ kind: "success", message: `Removed ${name} from board` });
+  }
+
   function handleCreateAgent(form: { name: string; host: string; repo: string }) {
     if (!form.name.trim()) {
       makeToast({ kind: "error", message: "Agent name required." });
@@ -2376,9 +2408,11 @@
   {#if showRoster}
     <RosterSidebar
       agents={roster.agents}
+      onBoard={mirroredAgents}
       {canEdit}
       on:close={() => (showRoster = false)}
       on:addAgent={({ detail }) => handleAddAgentToBoard(detail)}
+      on:removeAgent={({ detail }) => handleRemoveAgentFromBoard(detail)}
       on:createAgent={({ detail }) => handleCreateAgent(detail)}
     />
   {/if}

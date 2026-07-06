@@ -11,10 +11,14 @@
 
   export let agents: { name: string; host?: string; status?: string }[] = [];
   export let canEdit: boolean;
+  // Names currently mirrored on the board (matched against terminal labels
+  // by Session.svelte) — toggles each row between "+ Add" and "Remove".
+  export let onBoard: Set<string> = new Set();
 
   const dispatch = createEventDispatcher<{
     close: void;
     addAgent: string;
+    removeAgent: string;
     createAgent: { name: string; host: string; repo: string };
   }>();
 
@@ -53,17 +57,29 @@
       <p class="muted">Waiting for roster from bridge…</p>
     {/if}
     {#each agents as agent (agent.name)}
+      {@const mirrored = onBoard.has(agent.name)}
       <div class="row">
-        <span class="dot" class:online={agent.status === "online"} />
+        <span class="dot" class:online={mirrored} />
         <span class="name" title={agent.host ?? ""}>{agent.name}</span>
-        <button
-          class="add-btn"
-          disabled={!canEdit}
-          title="Add to board"
-          on:click={() => dispatch("addAgent", agent.name)}
-        >
-          + Add
-        </button>
+        {#if mirrored}
+          <button
+            class="add-btn remove-btn"
+            disabled={!canEdit}
+            title="Remove from board"
+            on:click={() => dispatch("removeAgent", agent.name)}
+          >
+            Remove
+          </button>
+        {:else}
+          <button
+            class="add-btn"
+            disabled={!canEdit}
+            title="Add to board"
+            on:click={() => dispatch("addAgent", agent.name)}
+          >
+            + Add
+          </button>
+        {/if}
       </div>
     {/each}
   </div>
@@ -124,6 +140,9 @@
   .add-btn {
     @apply text-[11px] px-1.5 py-0.5 rounded bg-zinc-700/60 text-zinc-200 flex-none;
     @apply hover:bg-indigo-600 hover:text-white disabled:opacity-40 disabled:hover:bg-zinc-700/60;
+  }
+  .remove-btn {
+    @apply hover:bg-red-600 disabled:hover:bg-zinc-700/60;
   }
   .muted {
     @apply px-3 py-1 text-xs text-zinc-500;
