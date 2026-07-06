@@ -3067,12 +3067,12 @@
       {#if fromShell}
         {@const fromWs = drawing.fromId === moving ? movingSize : fromShell[1]}
         {@const fromEl = termWrappers[drawing.fromId]}
-        {@const fromCenterX = fromWs.x + (fromEl?.offsetWidth ?? 0) / 2}
-        {@const fromCenterY = fromWs.y + (fromEl?.offsetHeight ?? 0) / 2}
+        <!-- เส้น preview ต้องเกิดจากตำแหน่งรู ⊙ (ขวา-กลาง) เสมอ ไม่ใช่ขอบที่
+             หันเข้าหา cursor — Louis: "ออกไม่ตรงรู" -->
+        {@const fromX = fromWs.x + (fromEl?.offsetWidth ?? 0)}
+        {@const fromY = fromWs.y + (fromEl?.offsetHeight ?? 0) / 2}
         {@const toX = drawing.toWorld[0]}
         {@const toY = drawing.toWorld[1]}
-        {@const fromEdge = clipToBoxEdge(fromCenterX, fromCenterY, (fromEl?.offsetWidth ?? 0) / 2, (fromEl?.offsetHeight ?? 0) / 2, toX - fromCenterX, toY - fromCenterY)}
-        {@const [fromX, fromY] = fromEdge}
         {@const previewAnchorX = Math.min(fromX, toX)}
         {@const previewAnchorY = Math.min(fromY, toY)}
         {@const previewW = Math.max(Math.abs(toX - fromX), 1)}
@@ -3084,12 +3084,15 @@
           style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
           use:slide={{ x: previewAnchorX, y: previewAnchorY, center, zoom, immediate: true }}
         >
+          {@const px1 = fromX <= toX ? 0 : previewW}
+          {@const py1 = fromY <= toY ? 0 : previewH}
+          {@const px2 = fromX <= toX ? previewW : 0}
+          {@const py2 = fromY <= toY ? previewH : 0}
+          {@const pdx = Math.max(48, Math.abs(px2 - px1) / 2)}
           <svg width={previewW} height={previewH} style="overflow: visible;">
-            <line
-              x1={fromX <= toX ? 0 : previewW}
-              y1={fromY <= toY ? 0 : previewH}
-              x2={fromX <= toX ? previewW : 0}
-              y2={fromY <= toY ? previewH : 0}
+            <path
+              d={`M ${px1} ${py1} C ${px1 + (px1 <= px2 ? pdx : -pdx)} ${py1}, ${px2 + (px1 <= px2 ? -pdx : pdx)} ${py2}, ${px2} ${py2}`}
+              fill="none"
               stroke="#a5b4fc"
               stroke-width="3"
               stroke-dasharray="4 4"
