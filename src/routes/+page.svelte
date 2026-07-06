@@ -15,15 +15,43 @@
     FolderIcon,
     ClockIcon,
     KeyIcon,
+    Trash2Icon,
   } from "svelte-feather-icons";
   import { makeToast } from "$lib/toast";
-  import { keyFor, saveKey } from "$lib/boardKeys";
+  import { keyFor, saveKey, removeKey } from "$lib/boardKeys";
 
   type BoardInfo = { name: string; live: boolean; modified: number | null; size: number | null };
 
   let boards: BoardInfo[] = [];
   let loading = true;
   let loadError = "";
+  let deletingName: string | null = null;
+
+  // Backlog item (Louis): no way to delete a test/stray board from the
+  // lobby. Proposed DELETE /api/boards/{name} in PLAN.md — not implemented
+  // server-side yet (needs Le, or his OK for me to touch crates/ just this
+  // once — both existing functions it'd call, state.close_session() and
+  // disk.delete(), are already there, just no route wired to them). This
+  // button is ready to go the moment the endpoint exists; until then it
+  // fails with a clear message rather than doing nothing silently.
+  async function deleteBoard(name: string) {
+    if (!window.confirm(`Delete board "${name}"? This can't be undone.`)) return;
+    deletingName = name;
+    try {
+      const res = await fetch(`/api/boards/${encodeURIComponent(name)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      boards = boards.filter((b) => b.name !== name);
+      removeKey(name);
+      makeToast({ kind: "success", message: `Deleted "${name}"` });
+    } catch (e) {
+      makeToast({
+        kind: "error",
+        message: `Couldn't delete: ${e instanceof Error ? e.message : "unknown error"}`,
+      });
+    } finally {
+      deletingName = null;
+    }
+  }
 
   async function loadBoards() {
     loading = true;
@@ -179,6 +207,14 @@
               Need key
             </button>
           {/if}
+          <button
+            class="delete-btn"
+            title="Delete board"
+            disabled={deletingName === board.name}
+            on:click={() => deleteBoard(board.name)}
+          >
+            <Trash2Icon size="14" />
+          </button>
         </div>
       {/each}
     </div>
@@ -277,6 +313,10 @@
   }
   .open-btn-secondary {
     @apply bg-zinc-800 text-zinc-400 hover:bg-amber-600 hover:text-white;
+  }
+  .delete-btn {
+    @apply p-2 rounded-md bg-zinc-800 text-zinc-500 flex-none;
+    @apply hover:bg-red-600 hover:text-white disabled:opacity-40 disabled:hover:bg-zinc-800;
   }
   .modal-backdrop {
     @apply fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4;
