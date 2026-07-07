@@ -47,6 +47,12 @@
    * jobTileWrappers below. `null` when no asset drag is in flight or the
    * pointer isn't over a shell. */
   export let dropTargetShellId: number | null = null;
+  /** Live cursor position (world coords) while dragging from an asset tile's
+   * ⊙ port toward a terminal (Vision Round 4 item 1, alink) — Session reads
+   * this to draw a live preview line the same way it already does for its
+   * own terminal-to-terminal link-port drags. `null` when no alink drag is
+   * in flight. */
+  export let assetLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
 
   // Screen-space snap distance; converted to world units (÷ zoom) so the pull
   // feels the same regardless of how far the board is zoomed.
@@ -95,6 +101,10 @@
     jobClearEndFrame: string;
     /** An image/video/job asset was dropped onto an agent's terminal (Session-owned shell). */
     assetDropOnShell: { assetItemId: string; shellId: number };
+    /** An asset's ⊙ port was connected to an agent's terminal — a persistent
+     * "this agent is holding this asset" link (Vision Round 4 item 1), not
+     * a one-shot send like assetDropOnShell above. */
+    assetLinkToShell: { assetItemId: string; shellId: number };
   }>();
 
   // ── Gen job node (image or video) — dataUrl is a JSON payload, not raw
@@ -296,6 +306,58 @@
     window.removeEventListener("pointercancel", cancelAssetDrag);
   }
 
+  // ── Asset ⊙ port drag (Vision Round 4 item 1 — "ต่อเส้น asset → agent"):
+  // a persistent hand-off, distinct from the one-shot assetDropOnShell above
+  // (docs/vision-round4-project-orders-design.md item 1: "ต่างจากลากทั้ง
+  // node ใส่ terminal (VR3): อันนั้นคือ ส่งของครั้งเดียว — อันนี้คือ
+  // มอบหมายให้ถือ"). Same ⊙-port visual language as Session.svelte's
+  // terminal-to-terminal link-port (startLinkDraw), just living here since
+  // the asset tile it starts from is Board-owned — only ever targets a
+  // terminal (no job-ref/end-frame; that's what the 📎 handle is for), so
+  // this is simpler than the asset-drag family: one hit-test, no priority
+  // chain.
+  let assetLinkItemId: string | null = null;
+  let assetLinkPointerId: number | null = null;
+
+  function startAssetLinkDraw(event: PointerEvent, itemId: string) {
+    if (hasWriteAccess === false) return;
+    event.preventDefault();
+    event.stopPropagation();
+    assetLinkItemId = itemId;
+    assetLinkPointerId = event.pointerId ?? null;
+    assetLinkPreview = { itemId, toWorld: normalizePosition(event) };
+    window.addEventListener("pointermove", onAssetLinkDrawMove);
+    window.addEventListener("pointerup", endAssetLinkDraw);
+    window.addEventListener("pointercancel", cancelAssetLinkDraw);
+  }
+
+  function onAssetLinkDrawMove(event: PointerEvent) {
+    if (assetLinkItemId === null || event.pointerId !== assetLinkPointerId) return;
+    assetLinkPreview = { itemId: assetLinkItemId, toWorld: normalizePosition(event) };
+    dropTargetShellId = findShellUnderPoint(event.clientX, event.clientY);
+  }
+
+  function endAssetLinkDraw(event: PointerEvent) {
+    if (assetLinkItemId === null || event.pointerId !== assetLinkPointerId) return;
+    const shellId = findShellUnderPoint(event.clientX, event.clientY);
+    if (shellId !== null) dispatch("assetLinkToShell", { assetItemId: assetLinkItemId, shellId });
+    cleanupAssetLinkDraw();
+  }
+
+  function cancelAssetLinkDraw() {
+    cleanupAssetLinkDraw();
+  }
+
+  function cleanupAssetLinkDraw() {
+    assetLinkItemId = null;
+    assetLinkPointerId = null;
+    assetLinkPreview = null;
+    dropTargetShellId = null;
+    window.removeEventListener("pointermove", onAssetLinkDrawMove);
+    window.removeEventListener("pointerup", endAssetLinkDraw);
+    window.removeEventListener("pointercancel", cancelAssetLinkDraw);
+  }
+
   // Drag state. While dragging, the dragged tile renders at `dragPos` and sends
   // BoardMove on a requestAnimationFrame cadence (contract v2: client throttle).
   const LONG_PRESS_MS = 180;
@@ -487,10 +549,13 @@
     window.removeEventListener("pointermove", onAssetDragMove);
     window.removeEventListener("pointerup", endAssetDrag);
     window.removeEventListener("pointercancel", cancelAssetDrag);
+    window.removeEventListener("pointermove", onAssetLinkDrawMove);
+    window.removeEventListener("pointerup", endAssetLinkDraw);
+    window.removeEventListener("pointercancel", cancelAssetLinkDraw);
   });
 </script>
 
-{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock" && it.kind !== "label" && it.kind !== "link" && it.kind !== "asset-drop") as item (item.id)}
+{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock" && it.kind !== "label" && it.kind !== "link" && it.kind !== "asset-drop" && it.kind !== "alink") as item (item.id)}
   {@const x = item.id === dragId ? dragPos[0] : item.x}
   {@const y = item.id === dragId ? dragPos[1] : item.y}
   <div
@@ -562,6 +627,19 @@
                   }}
                 >
                   <PaperclipIcon size="12" />
+                </button>
+                <!-- Vision Round 4 item 1: persistent "agent is holding this
+                     job" link, distinct from the one-shot share above. -->
+                <button
+                  class="job-link-port"
+                  title="Drag onto an agent's terminal to hand off this job (persistent link)"
+                  disabled={!job.prompt.trim()}
+                  on:pointerdown={(event) => {
+                    event.stopPropagation();
+                    startAssetLinkDraw(event, item.id);
+                  }}
+                >
+                  ⊙
                 </button>
               {/if}
             </div>
@@ -865,6 +943,16 @@
         >
           <PaperclipIcon size="12" />
         </button>
+        <!-- Vision Round 4 item 1: persistent "agent is holding this asset"
+             link, distinct from the one-shot share above (⊙ = same visual
+             language as Session.svelte's terminal-to-terminal link-port). -->
+        <button
+          class="asset-link-port"
+          title="Drag onto an agent's terminal to hand off this asset (persistent link)"
+          on:pointerdown={(event) => startAssetLinkDraw(event, item.id)}
+        >
+          ⊙
+        </button>
       {/if}
 
       {#if hasWriteAccess !== false}
@@ -1143,6 +1231,14 @@
     @apply disabled:cursor-not-allowed disabled:hover:bg-zinc-800 disabled:hover:text-zinc-500;
   }
 
+  /* Indigo (matching Session.svelte's terminal link-port line color) to
+     read as "connection", distinct from the amber one-shot-share handle. */
+  .job-link-port {
+    @apply p-1 ml-1 rounded bg-zinc-800 text-zinc-500 ring-1 ring-zinc-700 flex-none;
+    @apply hover:bg-indigo-600 hover:text-white cursor-crosshair touch-none disabled:opacity-30;
+    @apply disabled:cursor-not-allowed disabled:hover:bg-zinc-800 disabled:hover:text-zinc-500;
+  }
+
   .job-negative-prompt {
     @apply min-h-[44px] text-xs;
   }
@@ -1192,6 +1288,11 @@
     @apply opacity-0 transition-opacity hover:bg-amber-600 hover:text-white cursor-grab touch-none;
   }
 
+  .asset-link-port {
+    @apply absolute bottom-1 left-[92px] p-0.5 rounded bg-zinc-800/80 text-zinc-300 z-30;
+    @apply opacity-0 transition-opacity hover:bg-indigo-600 hover:text-white cursor-crosshair touch-none;
+  }
+
   .drag-grip {
     @apply absolute top-1 left-1 z-20 rounded bg-zinc-800/80 text-zinc-300;
     @apply px-1.5 py-0.5 text-xs leading-none cursor-move touch-none select-none;
@@ -1204,7 +1305,8 @@
 
   .board-item:hover .download,
   .board-item:hover .lightbox-open,
-  .board-item:hover .ref-handle {
+  .board-item:hover .ref-handle,
+  .board-item:hover .asset-link-port {
     @apply opacity-100;
   }
 
@@ -1232,6 +1334,7 @@
     .download,
     .lightbox-open,
     .ref-handle,
+    .asset-link-port,
     .drag-grip {
       @apply opacity-100 p-1.5;
     }

@@ -213,6 +213,11 @@
    * — Vision Round 3 item 2, docs/vision-round3-asset-to-cli-design.md), used
    * only to highlight the terminal about to receive the drop. */
   let dropTargetShellId: number | null = null;
+  /** Live cursor position while dragging an asset's ⊙ port toward a
+   * terminal (bind:assetLinkPreview — Vision Round 4 item 1), used to draw
+   * a live preview line the same way the terminal-to-terminal link-port
+   * drag already does below. `null` when no such drag is in flight. */
+  let assetLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
   const chunknums: Record<number, number> = {};
   const locks: Record<number, any> = {};
   let userId = 0;
@@ -1171,21 +1176,19 @@
   }
 
   // Add an image to the board (file picker, paste, or drag-and-drop).
-  function addImage(file: File) {
+  /** `onCreated` (Vision Round 4 item 2a — docs/vision-round4-project-
+   * orders-design.md) lets a caller act on the item once it exists, e.g.
+   * dropping straight onto a terminal both creates the tile AND hands it
+   * to that agent in the same gesture — see onDrop below. */
+  function addImage(file: File, onCreated?: (id: string) => void) {
     if (!canEdit) return;
     readImageFile(file, (dataUrl, w, h) => {
       const [x, y] = nextBoardPos();
-      const item: BoardItem = {
-        id: crypto.randomUUID(),
-        kind: "image",
-        x,
-        y,
-        w,
-        h,
-        dataUrl,
-      };
+      const id = crypto.randomUUID();
+      const item: BoardItem = { id, kind: "image", x, y, w, h, dataUrl };
       upsertBoardItem(item);
       srocket?.send({ boardPut: item });
+      onCreated?.(id);
     });
   }
 
@@ -1351,6 +1354,48 @@
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
   }
+
+  // Vision Round 4 item 1 — "ต่อเส้น asset → agent" (docs/vision-round4-
+  // project-orders-design.md). Persistent hand-off, not a one-shot command
+  // like asset-drop above: the id self-encodes both endpoints
+  // (`alink:<itemId>:<shellId>`, same convention link's `linkId()` uses) so
+  // the bridge needs nothing from dataUrl at all — it reads only the id.
+  // Deliberately no dedup check here: dragging the same asset onto the same
+  // shell again produces the same id, which the bridge's own boardPut
+  // `processed` gate already makes a silent no-op (the line's already
+  // there) — that's the intended behavior, not a bug to route around.
+  function handleAssetLinkToShell(assetItemId: string, shellId: number) {
+    if (!canEdit) return;
+    const item: BoardItem = {
+      id: `alink:${assetItemId}:${shellId}`,
+      kind: "alink",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: "",
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+  }
+
+  /** Parse an alink board item's endpoints, or null if not a (valid) alink. */
+  function assetLinkEndpoints(item: BoardItem): { itemId: string; shellId: number } | null {
+    if (item.kind !== "alink") return null;
+    const m = item.id.match(/^alink:(.+):(\d+)$/);
+    if (!m) return null;
+    return { itemId: m[1], shellId: parseInt(m[2], 10) };
+  }
+
+  /** Remove an asset↔shell link (the unlink gesture) — bridge notices the
+   * agent that the asset is no longer assigned to them. */
+  function removeAssetLink(itemId: string, shellId: number) {
+    if (!canEdit) return;
+    const id = `alink:${itemId}:${shellId}`;
+    removeBoardItem(id);
+    srocket?.send({ boardDelete: id });
+  }
+
 
   // The actual "post a job" moment per PLAN.md — bridge watches for
   // state:"pending" job items, runs generation, and posts a sibling
@@ -1850,7 +1895,8 @@
   // Add a video clip to the board. Local preview works at ANY size via an
   // object URL; the file is shared with peers (as a data URL) only when small
   // enough to fit over the WS. A download button on the tile lets anyone save it.
-  function addVideoFile(file: File) {
+  /** `onCreated` — see addImage above (Vision Round 4 item 2a). */
+  function addVideoFile(file: File, onCreated?: (id: string) => void) {
     if (!canEdit) return;
     if (!file.type.startsWith("video/")) return;
 
@@ -1867,6 +1913,7 @@
       dataUrl: URL.createObjectURL(file),
     };
     upsertBoardItem(item);
+    onCreated?.(id);
 
     if (file.size <= VIDEO_SHARE_CAP) {
       // Small enough to share: re-send as a data URL so peers can see + save it.
@@ -1906,9 +1953,22 @@
     const onDragOver = (event: DragEvent) => event.preventDefault();
     const onDrop = (event: DragEvent) => {
       event.preventDefault();
+      // Vision Round 4 item 2a (docs/vision-round4-project-orders-design.md):
+      // dropping straight onto an agent's terminal does the image-add above
+      // AND hands it to that agent in the same gesture, reusing the exact
+      // asset-drop pipeline from item 2 (Vision Round 3) — same
+      // elementFromPoint + [data-shell-id] hit-test Board.svelte's asset
+      // drags already use. Video is out of scope here (Phase D's media
+      // endpoint): addVideoFile's dataUrl is a local blob: URL the bridge
+      // could never fetch, so only image drops get the hand-off.
+      const dropEl = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+      const shellIdStr = dropEl?.closest<HTMLElement>("[data-shell-id]")?.dataset.shellId;
+      const shellId = shellIdStr !== undefined ? parseInt(shellIdStr, 10) : null;
       for (const file of event.dataTransfer?.files ?? []) {
         if (file.type.startsWith("video/")) addVideoFile(file);
-        else addImage(file);
+        else addImage(file, shellId !== null && !isNaN(shellId)
+          ? (id) => handleAssetDropOnShell(id, shellId)
+          : undefined);
       }
     };
     // Re-fit on rotate (the main "responsive" trigger on tablets/phones).
@@ -2829,6 +2889,7 @@
       extraGuidesV={termGuidesV}
       extraGuidesH={termGuidesH}
       bind:dropTargetShellId
+      bind:assetLinkPreview
       on:move={({ detail }) =>
         handleBoardMove(detail.id, detail.x, detail.y)}
       on:resize={({ detail }) =>
@@ -2843,6 +2904,7 @@
       on:jobSetEndFrame={({ detail }) => handleJobSetEndFrame(detail.id, detail.imageItemId)}
       on:jobClearEndFrame={({ detail }) => handleJobClearEndFrame(detail)}
       on:assetDropOnShell={({ detail }) => handleAssetDropOnShell(detail.assetItemId, detail.shellId)}
+      on:assetLinkToShell={({ detail }) => handleAssetLinkToShell(detail.assetItemId, detail.shellId)}
     />
 
     {#if contextMenu}
@@ -3124,6 +3186,127 @@
               d={`M ${px1} ${py1} C ${px1 + (px1 <= px2 ? pdx : -pdx)} ${py1}, ${px2 + (px1 <= px2 ? -pdx : pdx)} ${py2}, ${px2} ${py2}`}
               fill="none"
               stroke="#a5b4fc"
+              stroke-width="3"
+              stroke-dasharray="4 4"
+            />
+          </svg>
+        </div>
+      {/if}
+    {/if}
+
+    <!-- Persistent asset→agent links (Vision Round 4 item 1, "ต่อเส้น asset
+         → agent" — docs/vision-round4-project-orders-design.md): same
+         port-anchored bezier treatment as the terminal-to-terminal link
+         above, but one endpoint is a Board-owned asset tile resolved
+         straight from boardItems' own x/y/w/h (no DOM lookup needed —
+         unlike the shell side, which still needs termWrappers). Distinct
+         stroke color (emerald, vs. link's indigo) to read as "assignment"
+         rather than "conversation" at a glance. -->
+    {#each boardItems as item (item.id)}
+      {@const alink = assetLinkEndpoints(item)}
+      {#if alink}
+        {@const assetItem = boardItems.find((it) => it.id === alink.itemId)}
+        {@const shell = shells.find(([sid]) => sid === alink.shellId)}
+        {#if assetItem && shell && termWrappers[alink.shellId]?.offsetWidth}
+          {@const ws = alink.shellId === moving ? movingSize : shell[1]}
+          {@const el = termWrappers[alink.shellId]}
+          {@const assetCenterX = assetItem.x + assetItem.w / 2}
+          {@const shellCenterX = ws.x + (el?.offsetWidth ?? 0) / 2}
+          {@const assetIsLeft = assetCenterX <= shellCenterX}
+          {@const pointAx = assetIsLeft ? assetItem.x + assetItem.w : assetItem.x}
+          {@const pointAy = assetItem.y + assetItem.h / 2}
+          {@const pointBx = assetIsLeft ? ws.x : ws.x + (el?.offsetWidth ?? 0)}
+          {@const pointBy = ws.y + (el?.offsetHeight ?? 0) / 2}
+          {@const anchorX = Math.min(pointAx, pointBx)}
+          {@const anchorY = Math.min(pointAy, pointBy)}
+          {@const lineW = Math.max(Math.abs(pointBx - pointAx), 1)}
+          {@const lineH = Math.max(Math.abs(pointBy - pointAy), 1)}
+          {@const isHovered = hoveredLinkId === item.id}
+          {@const bx1 = pointAx <= pointBx ? 0 : lineW}
+          {@const by1 = pointAy <= pointBy ? 0 : lineH}
+          {@const bx2 = pointAx <= pointBx ? lineW : 0}
+          {@const by2 = pointAy <= pointBy ? lineH : 0}
+          {@const bdx = Math.max(48, Math.abs(bx2 - bx1) / 2)}
+          {@const bezier = `M ${bx1} ${by1} C ${bx1 + (bx1 <= bx2 ? bdx : -bdx)} ${by1}, ${bx2 + (bx1 <= bx2 ? -bdx : bdx)} ${by2}, ${bx2} ${by2}`}
+          <div
+            class="absolute pointer-events-none"
+            style:left={OFFSET_LEFT_CSS}
+            style:top={OFFSET_TOP_CSS}
+            style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+            use:slide={{ x: anchorX, y: anchorY, center, zoom, immediate: true }}
+          >
+            <svg width={lineW} height={lineH} style="overflow: visible;">
+              <path
+                d={bezier}
+                fill="none"
+                stroke="transparent"
+                stroke-width="16"
+                pointer-events="stroke"
+                style="cursor: pointer;"
+                on:pointerenter={() => (hoveredLinkId = item.id)}
+                on:pointerleave={() => (hoveredLinkId = null)}
+              />
+              <path
+                d={bezier}
+                fill="none"
+                stroke="#34d399"
+                stroke-width={isHovered ? 4 : 2.5}
+                stroke-dasharray="8 6"
+                opacity={isHovered ? 1 : 0.55}
+                pointer-events="none"
+                style="transition: opacity 120ms, stroke-width 120ms;"
+              />
+            </svg>
+            {#if canEdit}
+              <button
+                class="pointer-events-auto absolute flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-xs text-white shadow hover:bg-red-500"
+                style:left={`${lineW / 2 - 10}px`}
+                style:top={`${lineH / 2 - 10}px`}
+                title="Remove hand-off"
+                on:pointerdown={(e) => e.stopPropagation()}
+                on:click={() => removeAssetLink(alink.itemId, alink.shellId)}
+              >
+                ✕
+              </button>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+    {/each}
+
+    <!-- Live preview line while dragging an asset's ⊙ port toward a
+         terminal (see Board.svelte's startAssetLinkDraw) — same treatment
+         as the terminal-to-terminal link preview above, but the from-point
+         is a Board-owned asset tile's own x/y/w/h instead of a shell. -->
+    {#if assetLinkPreview}
+      {@const preview = assetLinkPreview}
+      {@const assetItem = boardItems.find((it) => it.id === preview.itemId)}
+      {#if assetItem}
+        {@const fromX = assetItem.x + assetItem.w}
+        {@const fromY = assetItem.y + assetItem.h / 2}
+        {@const toX = preview.toWorld[0]}
+        {@const toY = preview.toWorld[1]}
+        {@const previewAnchorX = Math.min(fromX, toX)}
+        {@const previewAnchorY = Math.min(fromY, toY)}
+        {@const previewW = Math.max(Math.abs(toX - fromX), 1)}
+        {@const previewH = Math.max(Math.abs(toY - fromY), 1)}
+        {@const px1 = fromX <= toX ? 0 : previewW}
+        {@const py1 = fromY <= toY ? 0 : previewH}
+        {@const px2 = fromX <= toX ? previewW : 0}
+        {@const py2 = fromY <= toY ? previewH : 0}
+        {@const pdx = Math.max(48, Math.abs(px2 - px1) / 2)}
+        <div
+          class="absolute pointer-events-none"
+          style:left={OFFSET_LEFT_CSS}
+          style:top={OFFSET_TOP_CSS}
+          style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+          use:slide={{ x: previewAnchorX, y: previewAnchorY, center, zoom, immediate: true }}
+        >
+          <svg width={previewW} height={previewH} style="overflow: visible;">
+            <path
+              d={`M ${px1} ${py1} C ${px1 + (px1 <= px2 ? pdx : -pdx)} ${py1}, ${px2 + (px1 <= px2 ? -pdx : pdx)} ${py2}, ${px2} ${py2}`}
+              fill="none"
+              stroke="#6ee7b7"
               stroke-width="3"
               stroke-dasharray="4 4"
             />
