@@ -205,11 +205,26 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
-                let Some(update_tx) = session.shell_backend(id).and_then(|b| session.backend_sender(b)) else {
-                    send(socket, WsServer::Error("shell has no owning backend".into())).await?;
-                    continue;
-                };
-                update_tx.send(ServerMessage::CloseShell(id.0)).await?;
+                match session.shell_backend(id) {
+                    Some(b) if session.backend_connected(b) => {
+                        let Some(update_tx) = session.backend_sender(b) else {
+                            send(socket, WsServer::Error("no backend available".into())).await?;
+                            continue;
+                        };
+                        update_tx.send(ServerMessage::CloseShell(id.0)).await?;
+                    }
+                    _ => {
+                        // Orphan shell: owning backend is gone or is a zombie
+                        // registry entry (disk-restored, process long dead) —
+                        // routing CloseShell there queues it forever and the
+                        // tile can never be closed from the UI. Close it
+                        // server-side instead, same as a backend-reported
+                        // ClosedShell.
+                        if let Err(err) = session.close_shell(id) {
+                            send(socket, WsServer::Error(err.to_string())).await?;
+                        }
+                    }
+                }
             }
             WsClient::Move(id, winsize) => {
                 if let Err(e) = session.check_write_permission(user_id) {

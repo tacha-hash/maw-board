@@ -285,6 +285,18 @@ impl Session {
         }
     }
 
+    /// Whether a backend currently has a live gRPC connection. Distinguishes
+    /// briefly-disconnected backends (will reconnect; queue messages for
+    /// them) from zombie registry entries restored from disk whose process
+    /// died with a previous server run (will never reconnect).
+    pub fn backend_connected(&self, id: BackendId) -> bool {
+        self.backends
+            .read()
+            .get(&id)
+            .map(|b| *b.connected.lock())
+            .unwrap_or(false)
+    }
+
     /// Get the sender for a specific backend's channel, for routing messages
     /// (Input/Resize/Close) from the browser to the backend that owns a
     /// given shell. Works regardless of current connection state.
