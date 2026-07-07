@@ -293,12 +293,24 @@ impl Session {
     }
 
     /// Pick a backend to receive a newly-created shell when the browser
-    /// doesn't specify one — round-robins over all currently registered
-    /// backends. A real backend-selector UI can replace this later without a
-    /// protocol change (see phase3-design.md).
+    /// doesn't specify one — round-robins over currently *connected*
+    /// backends. Disk-restored sessions keep zombie backend entries whose
+    /// process died with the previous server run; routing a create there
+    /// queues it into a channel nobody will ever read, silently eating
+    /// every Nth create. Falls back to all registered backends only when
+    /// none is connected, preserving the queue-while-briefly-disconnected
+    /// behavior for a sole backend. A real backend-selector UI can replace
+    /// this later without a protocol change (see phase3-design.md).
     pub fn pick_backend_for_create(&self) -> Option<BackendId> {
         let backends = self.backends.read();
-        let mut ids: Vec<BackendId> = backends.keys().copied().collect();
+        let mut ids: Vec<BackendId> = backends
+            .iter()
+            .filter(|(_, b)| *b.connected.lock())
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            ids = backends.keys().copied().collect();
+        }
         if ids.is_empty() {
             return None;
         }
