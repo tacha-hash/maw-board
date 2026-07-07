@@ -30,6 +30,7 @@
   import { makeToast } from "./toast";
   import { saveKey, removeKey } from "./boardKeys";
   import { parseJobPayload } from "./jobPayload";
+  import { parseOrderPayload, orderStatusItemId } from "./orderPayload";
   import {
     computeSnap,
     computeSnapTarget,
@@ -218,6 +219,9 @@
    * a live preview line the same way the terminal-to-terminal link-port
    * drag already does below. `null` when no such drag is in flight. */
   let assetLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
+  /** Same as assetLinkPreview above, but for a Work Order box's own ⊙ port
+   * (bind:orderLinkPreview — Vision Round 4 item 4, olink). */
+  let orderLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
   const chunknums: Record<number, number> = {};
   const locks: Record<number, any> = {};
   let userId = 0;
@@ -1238,6 +1242,118 @@
     };
     upsertBoardItem(item);
     srocket?.send({ boardPut: item });
+  }
+
+  // Vision Round 4 item 4 — Work Order node (docs/vision-round4-work-order-
+  // design.md). kind:"order" is frontend-owned only (title/prompt/inputs/
+  // dispatch_seq) — status/results live in a separate kind:"order-status"
+  // item the bridge owns, joined at render time in Board.svelte. This split
+  // (not a single collaborative-write item like "job") is deliberate: Le
+  // caught in review that job's pattern is only race-safe because both
+  // sides write at different *times* (generation takes seconds); an order
+  // can run for hours, so a prompt edit and an incoming result could
+  // genuinely collide on the same boardPut and silently drop one side.
+  function addOrderNode(pos?: [number, number]) {
+    if (!canEdit) return;
+    const [x, y] = pos ?? nextBoardPos();
+    const item: BoardItem = {
+      id: crypto.randomUUID(),
+      kind: "order",
+      x,
+      y,
+      w: 300,
+      h: 420,
+      dataUrl: JSON.stringify({ title: "", prompt: "", inputs: [], dispatch_seq: 0 }),
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+  }
+
+  function handleOrderAddInput(orderId: string, itemId: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === orderId);
+    if (!item || item.kind !== "order") return;
+    const order = parseOrderPayload(item.dataUrl);
+    if (order.inputs.includes(itemId)) return; // already an input, no-op
+    const updated = { ...item, dataUrl: JSON.stringify({ ...order, inputs: [...order.inputs, itemId] }) };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  function handleOrderRemoveInput(orderId: string, itemId: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === orderId);
+    if (!item || item.kind !== "order") return;
+    const order = parseOrderPayload(item.dataUrl);
+    const updated = {
+      ...item,
+      dataUrl: JSON.stringify({ ...order, inputs: order.inputs.filter((id) => id !== itemId) }),
+    };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  function handleOrderEdit(orderId: string, changes: { title?: string; prompt?: string }) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === orderId);
+    if (!item || item.kind !== "order") return;
+    const order = parseOrderPayload(item.dataUrl);
+    // Only overwrite fields actually present — `{...order, ...changes}` would
+    // blank e.g. title if changes only carries prompt (its key would still
+    // be `title: undefined`, which spread *does* apply, unlike a missing key).
+    if (changes.title !== undefined) order.title = changes.title;
+    if (changes.prompt !== undefined) order.prompt = changes.prompt;
+    const updated = { ...item, dataUrl: JSON.stringify(order) };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  /** Dispatch (or re-dispatch) — just bumps dispatch_seq and sends. Never
+   * touches status/results (order-status, bridge-owned) — the bridge scans
+   * olinks and writes its own item back once it sees the seq increase
+   * (idempotence guard on its side, docs/vision-round4-work-order-
+   * design.md § "Dispatch trigger + idempotence"). */
+  function handleOrderDispatch(orderId: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === orderId);
+    if (!item || item.kind !== "order") return;
+    const order = parseOrderPayload(item.dataUrl);
+    const updated = { ...item, dataUrl: JSON.stringify({ ...order, dispatch_seq: order.dispatch_seq + 1 }) };
+    upsertBoardItem(updated);
+    srocket?.send({ boardPut: updated });
+  }
+
+  /** olink:<orderId>:<shellId> — reserves an assignee, read by the bridge
+   * only at Dispatch time (no immediate introduce hey, unlike link/alink —
+   * see design note on why). */
+  function handleOrderLinkToShell(orderId: string, shellId: number) {
+    if (!canEdit) return;
+    const item: BoardItem = {
+      id: `olink:${orderId}:${shellId}`,
+      kind: "olink",
+      x: 0,
+      y: 0,
+      w: 0,
+      h: 0,
+      dataUrl: "",
+    };
+    upsertBoardItem(item);
+    srocket?.send({ boardPut: item });
+  }
+
+  /** Parse an olink board item's endpoints, or null if not a (valid) olink. */
+  function orderLinkEndpoints(item: BoardItem): { orderId: string; shellId: number } | null {
+    if (item.kind !== "olink") return null;
+    const m = item.id.match(/^olink:(.+):(\d+)$/);
+    if (!m) return null;
+    return { orderId: m[1], shellId: parseInt(m[2], 10) };
+  }
+
+  function removeOrderLink(orderId: string, shellId: number) {
+    if (!canEdit) return;
+    const id = `olink:${orderId}:${shellId}`;
+    removeBoardItem(id);
+    srocket?.send({ boardDelete: id });
   }
 
   // job "item" parsing/defaults now live in ./jobPayload, shared with
@@ -2596,6 +2712,23 @@
 
   function handleBoardDelete(id: string) {
     if (!canEdit) return;
+    // Vision Round 4 item 4 (Le review): deleting an order cascade-deletes
+    // its olinks always, dispatched or not — a dangling olink pointing at a
+    // gone order is meaningless (the bridge only ever reads olinks by
+    // scanning for a specific orderId, so one with no matching order left
+    // is just inert clutter, not a bug, but there's no reason to leave it).
+    // order-status:<id> is NOT deleted here — that's bridge-owned; it sees
+    // this same boardDelete and cleans up its own item (+ sends the
+    // cancellation notice to any not-yet-done assignee).
+    const deletedItem = boardItems.find((it) => it.id === id);
+    if (deletedItem?.kind === "order") {
+      for (const it of boardItems) {
+        if (it.kind === "olink" && it.id.startsWith(`olink:${id}:`)) {
+          removeBoardItem(it.id);
+          srocket?.send({ boardDelete: it.id });
+        }
+      }
+    }
     removeBoardItem(id);
     srocket?.send({ boardDelete: id });
   }
@@ -2905,6 +3038,13 @@
       on:jobClearEndFrame={({ detail }) => handleJobClearEndFrame(detail)}
       on:assetDropOnShell={({ detail }) => handleAssetDropOnShell(detail.assetItemId, detail.shellId)}
       on:assetLinkToShell={({ detail }) => handleAssetLinkToShell(detail.assetItemId, detail.shellId)}
+      bind:orderLinkPreview
+      on:orderAddInput={({ detail }) => handleOrderAddInput(detail.id, detail.itemId)}
+      on:orderRemoveInput={({ detail }) => handleOrderRemoveInput(detail.id, detail.itemId)}
+      on:orderEdit={({ detail }) =>
+        handleOrderEdit(detail.id, { title: detail.title, prompt: detail.prompt })}
+      on:orderDispatch={({ detail }) => handleOrderDispatch(detail)}
+      on:orderLinkToShell={({ detail }) => handleOrderLinkToShell(detail.orderId, detail.shellId)}
     />
 
     {#if contextMenu}
@@ -2915,6 +3055,7 @@
         on:terminal={() => handleCreate([menu.worldX, menu.worldY])}
         on:note={() => addNote([menu.worldX, menu.worldY])}
         on:imageGen={() => addJobNode([menu.worldX, menu.worldY])}
+        on:workOrder={() => addOrderNode([menu.worldX, menu.worldY])}
         on:meeting={() =>
           makeToast({ kind: "info", message: "Meeting node — coming soon." })}
         on:close={closeContextMenu}
@@ -3307,6 +3448,122 @@
               d={`M ${px1} ${py1} C ${px1 + (px1 <= px2 ? pdx : -pdx)} ${py1}, ${px2 + (px1 <= px2 ? -pdx : pdx)} ${py2}, ${px2} ${py2}`}
               fill="none"
               stroke="#6ee7b7"
+              stroke-width="3"
+              stroke-dasharray="4 4"
+            />
+          </svg>
+        </div>
+      {/if}
+    {/if}
+
+    <!-- Persistent order→agent links (Vision Round 4 item 4, olink) — same
+         treatment as alink above, but the left endpoint is an order item
+         instead of an asset item. Amber stroke to read as "reserved
+         assignee" distinct from alink's emerald "holding an asset". -->
+    {#each boardItems as item (item.id)}
+      {@const olink = orderLinkEndpoints(item)}
+      {#if olink}
+        {@const orderItem = boardItems.find((it) => it.id === olink.orderId)}
+        {@const shell = shells.find(([sid]) => sid === olink.shellId)}
+        {#if orderItem && shell && termWrappers[olink.shellId]?.offsetWidth}
+          {@const ws = olink.shellId === moving ? movingSize : shell[1]}
+          {@const el = termWrappers[olink.shellId]}
+          {@const orderCenterX = orderItem.x + orderItem.w / 2}
+          {@const shellCenterX = ws.x + (el?.offsetWidth ?? 0) / 2}
+          {@const orderIsLeft = orderCenterX <= shellCenterX}
+          {@const pointAx = orderIsLeft ? orderItem.x + orderItem.w : orderItem.x}
+          {@const pointAy = orderItem.y + orderItem.h / 2}
+          {@const pointBx = orderIsLeft ? ws.x : ws.x + (el?.offsetWidth ?? 0)}
+          {@const pointBy = ws.y + (el?.offsetHeight ?? 0) / 2}
+          {@const anchorX = Math.min(pointAx, pointBx)}
+          {@const anchorY = Math.min(pointAy, pointBy)}
+          {@const lineW = Math.max(Math.abs(pointBx - pointAx), 1)}
+          {@const lineH = Math.max(Math.abs(pointBy - pointAy), 1)}
+          {@const isHovered = hoveredLinkId === item.id}
+          {@const bx1 = pointAx <= pointBx ? 0 : lineW}
+          {@const by1 = pointAy <= pointBy ? 0 : lineH}
+          {@const bx2 = pointAx <= pointBx ? lineW : 0}
+          {@const by2 = pointAy <= pointBy ? lineH : 0}
+          {@const bdx = Math.max(48, Math.abs(bx2 - bx1) / 2)}
+          {@const bezier = `M ${bx1} ${by1} C ${bx1 + (bx1 <= bx2 ? bdx : -bdx)} ${by1}, ${bx2 + (bx1 <= bx2 ? -bdx : bdx)} ${by2}, ${bx2} ${by2}`}
+          <div
+            class="absolute pointer-events-none"
+            style:left={OFFSET_LEFT_CSS}
+            style:top={OFFSET_TOP_CSS}
+            style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+            use:slide={{ x: anchorX, y: anchorY, center, zoom, immediate: true }}
+          >
+            <svg width={lineW} height={lineH} style="overflow: visible;">
+              <path
+                d={bezier}
+                fill="none"
+                stroke="transparent"
+                stroke-width="16"
+                pointer-events="stroke"
+                style="cursor: pointer;"
+                on:pointerenter={() => (hoveredLinkId = item.id)}
+                on:pointerleave={() => (hoveredLinkId = null)}
+              />
+              <path
+                d={bezier}
+                fill="none"
+                stroke="#fbbf24"
+                stroke-width={isHovered ? 4 : 2.5}
+                stroke-dasharray="8 6"
+                opacity={isHovered ? 1 : 0.55}
+                pointer-events="none"
+                style="transition: opacity 120ms, stroke-width 120ms;"
+              />
+            </svg>
+            {#if canEdit}
+              <button
+                class="pointer-events-auto absolute flex h-5 w-5 items-center justify-center rounded-full bg-amber-500 text-xs text-white shadow hover:bg-red-500"
+                style:left={`${lineW / 2 - 10}px`}
+                style:top={`${lineH / 2 - 10}px`}
+                title="Remove assignee"
+                on:pointerdown={(e) => e.stopPropagation()}
+                on:click={() => removeOrderLink(olink.orderId, olink.shellId)}
+              >
+                ✕
+              </button>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+    {/each}
+
+    <!-- Live preview line while dragging a Work Order's own ⊙ port toward a
+         terminal (see Board.svelte's startOrderLinkDraw) — same treatment
+         as the asset ⊙ port preview above, from-point is the order item. -->
+    {#if orderLinkPreview}
+      {@const preview = orderLinkPreview}
+      {@const orderItem = boardItems.find((it) => it.id === preview.itemId)}
+      {#if orderItem}
+        {@const fromX = orderItem.x + orderItem.w}
+        {@const fromY = orderItem.y + orderItem.h / 2}
+        {@const toX = preview.toWorld[0]}
+        {@const toY = preview.toWorld[1]}
+        {@const previewAnchorX = Math.min(fromX, toX)}
+        {@const previewAnchorY = Math.min(fromY, toY)}
+        {@const previewW = Math.max(Math.abs(toX - fromX), 1)}
+        {@const previewH = Math.max(Math.abs(toY - fromY), 1)}
+        {@const px1 = fromX <= toX ? 0 : previewW}
+        {@const py1 = fromY <= toY ? 0 : previewH}
+        {@const px2 = fromX <= toX ? previewW : 0}
+        {@const py2 = fromY <= toY ? previewH : 0}
+        {@const pdx = Math.max(48, Math.abs(px2 - px1) / 2)}
+        <div
+          class="absolute pointer-events-none"
+          style:left={OFFSET_LEFT_CSS}
+          style:top={OFFSET_TOP_CSS}
+          style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+          use:slide={{ x: previewAnchorX, y: previewAnchorY, center, zoom, immediate: true }}
+        >
+          <svg width={previewW} height={previewH} style="overflow: visible;">
+            <path
+              d={`M ${px1} ${py1} C ${px1 + (px1 <= px2 ? pdx : -pdx)} ${py1}, ${px2 + (px1 <= px2 ? -pdx : pdx)} ${py2}, ${px2} ${py2}`}
+              fill="none"
+              stroke="#fcd34d"
               stroke-width="3"
               stroke-dasharray="4 4"
             />

@@ -19,6 +19,12 @@
   import type { BoardItem } from "../protocol";
   import { parseJobPayload as parseJob, type JobPayload } from "../jobPayload";
   import { findGenModel, brandGroupsFor, modelsFor, type GenModel } from "../genModels";
+  import {
+    parseOrderPayload,
+    parseOrderStatusPayload,
+    orderStatusItemId,
+    latestResultFor,
+  } from "../orderPayload";
 
   /** Board items (images + screen-share placeholder tiles). */
   export let items: BoardItem[];
@@ -53,6 +59,13 @@
    * own terminal-to-terminal link-port drags. `null` when no alink drag is
    * in flight. */
   export let assetLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
+  /** Same as assetLinkPreview above, but for dragging an order node's own ⊙
+   * port toward a terminal (olink, Vision Round 4 item 4) instead of an
+   * asset tile's. Kept as a separate prop rather than reusing
+   * assetLinkPreview since the two need distinct "from" resolution in
+   * Session.svelte (order item vs. asset item) — same shape, different
+   * source. */
+  export let orderLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
 
   // Screen-space snap distance; converted to world units (÷ zoom) so the pull
   // feels the same regardless of how far the board is zoomed.
@@ -105,6 +118,18 @@
      * "this agent is holding this asset" link (Vision Round 4 item 1), not
      * a one-shot send like assetDropOnShell above. */
     assetLinkToShell: { assetItemId: string; shellId: number };
+    /** An asset/video/note/job tile was dragged onto a Work Order box (Vision
+     * Round 4 item 4) — becomes an input chip. */
+    orderAddInput: { id: string; itemId: string };
+    /** Remove one input chip by item id. */
+    orderRemoveInput: { id: string; itemId: string };
+    orderEdit: { id: string; title?: string; prompt?: string };
+    /** Dispatch (or re-dispatch) button pressed — Session.svelte bumps dispatch_seq. */
+    orderDispatch: string;
+    /** A Work Order's own ⊙ port was connected to an agent's terminal —
+     * reserves that agent as an assignee (read at Dispatch time, no
+     * immediate bridge action — see design note). */
+    orderLinkToShell: { orderId: string; shellId: number };
   }>();
 
   // ── Gen job node (image or video) — dataUrl is a JSON payload, not raw
@@ -201,16 +226,31 @@
   // drop target nested inside a job node — checked first so dropping exactly
   // on the end-frame box doesn't get swallowed by the whole-node ref target.
   const endFrameSlotWrappers: Record<string, HTMLDivElement> = {};
+  // Work Order boxes (Vision Round 4 item 4) — another whole-node drop
+  // target, same technique as jobTileWrappers, checked after job-ref so a
+  // job-node ref-add still wins when a job and an order visually overlap.
+  const orderTileWrappers: Record<string, HTMLDivElement> = {};
   let assetDragItemId: string | null = null;
-  /** i2i ref / end-frame targets only make sense for images — video/job
-   * drags skip straight to shell-hit-testing. */
-  let assetDragKind: "image" | "video" | "job" | null = null;
+  /** i2i ref / end-frame targets only make sense for images — video/job/note
+   * drags skip straight to shell-hit-testing (note skips shell entirely —
+   * dropping a note "on" an agent doesn't mean anything, only "into an
+   * order" does). */
+  let assetDragKind: "image" | "video" | "job" | "note" | null = null;
   let assetDragPointerId: number | null = null;
   let dropTargetJobId: string | null = null;
   let dropTargetEndFrameId: string | null = null;
+  let dropTargetOrderId: string | null = null;
 
   function findJobUnderPoint(x: number, y: number): string | null {
     for (const [id, el] of Object.entries(jobTileWrappers)) {
+      const r = el.getBoundingClientRect();
+      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id;
+    }
+    return null;
+  }
+
+  function findOrderUnderPoint(x: number, y: number): string | null {
+    for (const [id, el] of Object.entries(orderTileWrappers)) {
       const r = el.getBoundingClientRect();
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id;
     }
@@ -238,7 +278,7 @@
     return isNaN(id) ? null : id;
   }
 
-  function startAssetDrag(event: PointerEvent, itemId: string, kind: "image" | "video" | "job") {
+  function startAssetDrag(event: PointerEvent, itemId: string, kind: "image" | "video" | "job" | "note") {
     if (hasWriteAccess === false) return;
     event.preventDefault();
     event.stopPropagation();
@@ -257,10 +297,19 @@
       dropTargetEndFrameId = findEndFrameSlotUnderPoint(x, y);
       dropTargetShellId = dropTargetEndFrameId ? null : findShellUnderPoint(x, y);
       dropTargetJobId = dropTargetEndFrameId || dropTargetShellId !== null ? null : findJobUnderPoint(x, y);
+      dropTargetOrderId = dropTargetEndFrameId || dropTargetShellId !== null || dropTargetJobId
+        ? null : findOrderUnderPoint(x, y);
+    } else if (assetDragKind === "note") {
+      // Notes only ever become order inputs — no end-frame/shell/job-ref.
+      dropTargetEndFrameId = null;
+      dropTargetShellId = null;
+      dropTargetJobId = null;
+      dropTargetOrderId = findOrderUnderPoint(x, y);
     } else {
       dropTargetEndFrameId = null;
       dropTargetJobId = null;
       dropTargetShellId = findShellUnderPoint(x, y);
+      dropTargetOrderId = dropTargetShellId !== null ? null : findOrderUnderPoint(x, y);
     }
   }
 
@@ -282,10 +331,25 @@
         return;
       }
       const targetId = findJobUnderPoint(x, y);
-      if (targetId) dispatch("jobAddImageRef", { id: targetId, imageItemId: assetItemId });
+      if (targetId) {
+        dispatch("jobAddImageRef", { id: targetId, imageItemId: assetItemId });
+        cleanupAssetDrag();
+        return;
+      }
+      const orderId = findOrderUnderPoint(x, y);
+      if (orderId) dispatch("orderAddInput", { id: orderId, itemId: assetItemId });
+    } else if (assetDragKind === "note") {
+      const orderId = findOrderUnderPoint(x, y);
+      if (orderId) dispatch("orderAddInput", { id: orderId, itemId: assetItemId });
     } else {
       const shellId = findShellUnderPoint(x, y);
-      if (shellId !== null) dispatch("assetDropOnShell", { assetItemId, shellId });
+      if (shellId !== null) {
+        dispatch("assetDropOnShell", { assetItemId, shellId });
+        cleanupAssetDrag();
+        return;
+      }
+      const orderId = findOrderUnderPoint(x, y);
+      if (orderId) dispatch("orderAddInput", { id: orderId, itemId: assetItemId });
     }
     cleanupAssetDrag();
   }
@@ -301,6 +365,7 @@
     dropTargetJobId = null;
     dropTargetEndFrameId = null;
     dropTargetShellId = null;
+    dropTargetOrderId = null;
     window.removeEventListener("pointermove", onAssetDragMove);
     window.removeEventListener("pointerup", endAssetDrag);
     window.removeEventListener("pointercancel", cancelAssetDrag);
@@ -356,6 +421,55 @@
     window.removeEventListener("pointermove", onAssetLinkDrawMove);
     window.removeEventListener("pointerup", endAssetLinkDraw);
     window.removeEventListener("pointercancel", cancelAssetLinkDraw);
+  }
+
+  // ── Order ⊙ port drag (Vision Round 4 item 4 — "ลากเส้นจากกล่อง → agent"):
+  // reserves an assignee for a Work Order, mirroring the asset ⊙ port family
+  // above exactly (same one-hit-test-no-priority-chain shape) — the only
+  // difference is which item the line's "from" point resolves to in
+  // Session.svelte (an order item, not an asset item), so this stays a
+  // parallel set of functions rather than a parameterized shared one, same
+  // as the asset-link family did for the terminal-to-terminal link-port.
+  let orderLinkItemId: string | null = null;
+  let orderLinkPointerId: number | null = null;
+
+  function startOrderLinkDraw(event: PointerEvent, orderId: string) {
+    if (hasWriteAccess === false) return;
+    event.preventDefault();
+    event.stopPropagation();
+    orderLinkItemId = orderId;
+    orderLinkPointerId = event.pointerId ?? null;
+    orderLinkPreview = { itemId: orderId, toWorld: normalizePosition(event) };
+    window.addEventListener("pointermove", onOrderLinkDrawMove);
+    window.addEventListener("pointerup", endOrderLinkDraw);
+    window.addEventListener("pointercancel", cancelOrderLinkDraw);
+  }
+
+  function onOrderLinkDrawMove(event: PointerEvent) {
+    if (orderLinkItemId === null || event.pointerId !== orderLinkPointerId) return;
+    orderLinkPreview = { itemId: orderLinkItemId, toWorld: normalizePosition(event) };
+    dropTargetShellId = findShellUnderPoint(event.clientX, event.clientY);
+  }
+
+  function endOrderLinkDraw(event: PointerEvent) {
+    if (orderLinkItemId === null || event.pointerId !== orderLinkPointerId) return;
+    const shellId = findShellUnderPoint(event.clientX, event.clientY);
+    if (shellId !== null) dispatch("orderLinkToShell", { orderId: orderLinkItemId, shellId });
+    cleanupOrderLinkDraw();
+  }
+
+  function cancelOrderLinkDraw() {
+    cleanupOrderLinkDraw();
+  }
+
+  function cleanupOrderLinkDraw() {
+    orderLinkItemId = null;
+    orderLinkPointerId = null;
+    orderLinkPreview = null;
+    dropTargetShellId = null;
+    window.removeEventListener("pointermove", onOrderLinkDrawMove);
+    window.removeEventListener("pointerup", endOrderLinkDraw);
+    window.removeEventListener("pointercancel", cancelOrderLinkDraw);
   }
 
   // Drag state. While dragging, the dragged tile renders at `dragPos` and sends
@@ -552,10 +666,13 @@
     window.removeEventListener("pointermove", onAssetLinkDrawMove);
     window.removeEventListener("pointerup", endAssetLinkDraw);
     window.removeEventListener("pointercancel", cancelAssetLinkDraw);
+    window.removeEventListener("pointermove", onOrderLinkDrawMove);
+    window.removeEventListener("pointerup", endOrderLinkDraw);
+    window.removeEventListener("pointercancel", cancelOrderLinkDraw);
   });
 </script>
 
-{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock" && it.kind !== "label" && it.kind !== "link" && it.kind !== "asset-drop" && it.kind !== "alink") as item (item.id)}
+{#each items.filter((it) => it.kind !== "doc" && it.kind !== "lock" && it.kind !== "label" && it.kind !== "link" && it.kind !== "asset-drop" && it.kind !== "alink" && it.kind !== "order-status") as item (item.id)}
   {@const x = item.id === dragId ? dragPos[0] : item.x}
   {@const y = item.id === dragId ? dragPos[1] : item.y}
   <div
@@ -571,6 +688,7 @@
       class:is-stream={item.kind === "stream"}
       class:is-note={item.kind === "note"}
       class:is-job={item.kind === "job"}
+      class:is-order={item.kind === "order"}
       style:width="{item.w}px"
       on:pointerdown={(event) => onPointerDown(event, item)}
     >
@@ -875,6 +993,136 @@
             {/if}
           </div>
         </div>
+      {:else if item.kind === "order"}
+        {@const order = parseOrderPayload(item.dataUrl)}
+        {@const statusItem = items.find((it) => it.id === orderStatusItemId(item.id))}
+        {@const orderStatus = statusItem ? parseOrderStatusPayload(statusItem.dataUrl) : { last_dispatch_seq: 0, status: {}, results: [] }}
+        {@const assignees = Object.keys(orderStatus.status)}
+        {@const hasOlink = items.some((it) => it.kind === "olink" && it.id.startsWith(`olink:${item.id}:`))}
+        <div
+          class="order-node"
+          class:is-drop-target={dropTargetOrderId === item.id}
+          bind:this={orderTileWrappers[item.id]}
+        >
+          <div class="order-head">
+            <span class="order-icon">📋</span>
+            <input
+              class="order-title"
+              placeholder="Untitled order"
+              value={order.title}
+              readonly={hasWriteAccess === false}
+              on:pointerdown={(event) => event.stopPropagation()}
+              on:input={(event) =>
+                dispatch("orderEdit", { id: item.id, title: event.currentTarget.value })}
+            />
+            {#if hasWriteAccess !== false}
+              <!-- Vision Round 4 item 4: reserves an assignee, read at
+                   Dispatch time — no immediate hey (see design note on why
+                   this differs from alink/link's immediate introduce). -->
+              <button
+                class="order-link-port"
+                title="Drag onto an agent's terminal to assign them to this order"
+                on:pointerdown={(event) => {
+                  event.stopPropagation();
+                  startOrderLinkDraw(event, item.id);
+                }}
+              >
+                ⊙
+              </button>
+            {/if}
+          </div>
+
+          <div class="job-section">
+            <span class="job-label">
+              Inputs ({order.inputs.length}) — drag image/video/note/job tiles here
+            </span>
+            <div class="ref-slots">
+              {#each order.inputs as inputId (inputId)}
+                {@const inputItem = items.find((it) => it.id === inputId)}
+                {#if inputItem}
+                  <div class="ref-thumb order-input-chip">
+                    {#if inputItem.kind === "image"}
+                      <img src={inputItem.dataUrl} alt="input" />
+                    {:else if inputItem.kind === "video"}
+                      <VideoIcon size="18" />
+                    {:else if inputItem.kind === "note"}
+                      <div class="order-input-note">{inputItem.dataUrl.slice(0, 40)}</div>
+                    {:else}
+                      <ZapIcon size="18" />
+                    {/if}
+                    {#if hasWriteAccess !== false}
+                      <button
+                        class="ref-remove"
+                        on:pointerdown={(event) => event.stopPropagation()}
+                        on:click={() => dispatch("orderRemoveInput", { id: item.id, itemId: inputId })}
+                      >
+                        <XIcon size="10" />
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              {/each}
+              {#if order.inputs.length === 0}
+                <div class="ref-empty">no inputs yet</div>
+              {/if}
+            </div>
+          </div>
+
+          <textarea
+            class="job-prompt"
+            placeholder={'Prompt ("ทำโปสเตอร์จากรูปพวกนี้ โทนส้ม ขนาด A4")'}
+            readonly={hasWriteAccess === false}
+            on:pointerdown={(event) => event.stopPropagation()}
+            on:input={(event) =>
+              dispatch("orderEdit", { id: item.id, prompt: event.currentTarget.value })}
+          >{order.prompt}</textarea>
+
+          {#if assignees.length > 0}
+            <div class="job-section">
+              <span class="job-label">Assignees</span>
+              <div class="order-status-table">
+                {#each assignees as agent (agent)}
+                  {@const s = orderStatus.status[agent]}
+                  {@const result = latestResultFor(orderStatus.results, agent)}
+                  {@const resultItem = result ? items.find((it) => it.id === result.itemId) : undefined}
+                  <div class="order-status-row">
+                    <span class="order-status-icon">
+                      {s === "done" ? "✅" : s === "error" ? "❌" : s === "working" ? "⚙️" : "⏳"}
+                    </span>
+                    <span class="order-status-agent">{agent}</span>
+                    {#if resultItem}
+                      <button
+                        class="order-result-thumb"
+                        title="Open result"
+                        on:pointerdown={(event) => event.stopPropagation()}
+                        on:click={() => openLightbox(resultItem.dataUrl, resultItem.kind === "video")}
+                      >
+                        {#if resultItem.kind === "video"}
+                          <!-- svelte-ignore a11y-media-has-caption -->
+                          <video src={resultItem.dataUrl} muted playsinline />
+                        {:else}
+                          <img src={resultItem.dataUrl} alt="result" />
+                        {/if}
+                      </button>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if hasWriteAccess !== false}
+            <button
+              class="job-btn job-btn-primary"
+              disabled={!order.prompt.trim() || !hasOlink}
+              on:pointerdown={(event) => event.stopPropagation()}
+              on:click={() => dispatch("orderDispatch", item.id)}
+            >
+              <ZapIcon size="14" />
+              <span>{order.dispatch_seq > 0 ? "Re-dispatch" : "Dispatch"}</span>
+            </button>
+          {/if}
+        </div>
       {:else if item.kind === "note"}
         <textarea
           class="note-text"
@@ -889,6 +1137,18 @@
               text: event.currentTarget.value,
             })}
         />
+        {#if hasWriteAccess !== false}
+          <!-- Vision Round 4 item 4: notes are a valid Work Order input
+               (design note item 4) but had no drag handle at all before —
+               reuses the same asset-drag machinery as image/video/job. -->
+          <button
+            class="ref-handle"
+            title="Drag onto a Work Order box to add as input"
+            on:pointerdown={(event) => startAssetDrag(event, item.id, "note")}
+          >
+            <PaperclipIcon size="12" />
+          </button>
+        {/if}
       {:else if item.kind === "video"}
         <!-- svelte-ignore a11y-media-has-caption -->
         <video
@@ -1080,6 +1340,10 @@
     @apply ring-indigo-400/60 shadow-indigo-900/30;
   }
 
+  .board-item.is-order {
+    @apply ring-emerald-400/60 shadow-emerald-900/30;
+  }
+
   .job-node {
     @apply flex flex-col gap-2.5 p-2.5 bg-zinc-900 cursor-default overflow-y-auto;
   }
@@ -1208,6 +1472,69 @@
 
   .job-result-thumb img,
   .job-result-thumb video {
+    @apply w-full h-full object-cover;
+  }
+
+  /* Vision Round 4 item 4 — Work Order node. Reuses .job-section/.job-label/
+     .ref-slots/.ref-thumb/.ref-remove/.ref-empty/.job-prompt/.job-btn
+     wholesale (same visual language as the job node), only new classes
+     below. */
+  .order-node {
+    @apply flex flex-col gap-2.5 p-2.5 bg-zinc-900 cursor-default overflow-y-auto;
+  }
+
+  .order-node.is-drop-target {
+    @apply ring-2 ring-amber-400;
+  }
+
+  .order-head {
+    @apply flex items-center gap-2;
+  }
+
+  .order-icon {
+    @apply text-base leading-none flex-none;
+  }
+
+  .order-title {
+    @apply flex-1 min-w-0 bg-transparent outline-none border-0 text-sm font-semibold;
+    @apply text-zinc-100 placeholder-zinc-500;
+  }
+
+  .order-link-port {
+    @apply p-1 rounded bg-zinc-800 text-zinc-500 ring-1 ring-zinc-700 flex-none;
+    @apply hover:bg-indigo-600 hover:text-white cursor-crosshair touch-none;
+  }
+
+  .order-input-chip {
+    @apply flex items-center justify-center bg-zinc-900;
+  }
+
+  .order-input-note {
+    @apply text-[9px] leading-tight text-zinc-300 p-0.5 overflow-hidden;
+  }
+
+  .order-status-table {
+    @apply flex flex-col gap-1;
+  }
+
+  .order-status-row {
+    @apply flex items-center gap-1.5 text-xs text-zinc-300;
+  }
+
+  .order-status-icon {
+    @apply flex-none;
+  }
+
+  .order-status-agent {
+    @apply flex-1 truncate;
+  }
+
+  .order-result-thumb {
+    @apply w-8 h-8 flex-none rounded overflow-hidden ring-1 ring-zinc-700;
+  }
+
+  .order-result-thumb img,
+  .order-result-thumb video {
     @apply w-full h-full object-cover;
   }
 

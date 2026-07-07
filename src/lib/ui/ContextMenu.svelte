@@ -11,6 +11,7 @@
     FileTextIcon,
     ImageIcon,
     UsersIcon,
+    ClipboardIcon,
   } from "svelte-feather-icons";
 
   export let x: number;
@@ -21,10 +22,11 @@
     note: void;
     imageGen: void;
     meeting: void;
+    workOrder: void;
     close: void;
   }>();
 
-  function pick(kind: "terminal" | "note" | "imageGen" | "meeting") {
+  function pick(kind: "terminal" | "note" | "imageGen" | "meeting" | "workOrder") {
     dispatch(kind);
     dispatch("close");
   }
@@ -53,6 +55,10 @@
   <button class="item" on:click={() => pick("imageGen")}>
     <ImageIcon size="15" />
     New Image-gen Node
+  </button>
+  <button class="item" on:click={() => pick("workOrder")}>
+    <ClipboardIcon size="15" />
+    New Work Order
   </button>
   <button class="item disabled" disabled title="Coming soon">
     <UsersIcon size="15" />
