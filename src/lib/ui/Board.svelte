@@ -1090,7 +1090,19 @@
                       {s === "done" ? "✅" : s === "error" ? "❌" : s === "working" ? "⚙️" : "⏳"}
                     </span>
                     <span class="order-status-agent">{agent}</span>
-                    {#if resultItem}
+                    {#if resultItem && resultItem.kind === "note"}
+                      <!-- Text-only results (board-put.ts result --order --text)
+                           aren't an image/video to open in a lightbox — show a
+                           short inline snippet instead. Tolerant of the note's
+                           dataUrl being either raw text (the note tile's own
+                           convention) or a {text} JSON wrapper, since which one
+                           the bridge writes for these is still settling. -->
+                      {@const noteText = (() => {
+                        try { const p = JSON.parse(resultItem.dataUrl); return typeof p.text === "string" ? p.text : resultItem.dataUrl; }
+                        catch { return resultItem.dataUrl; }
+                      })()}
+                      <span class="order-result-note" title={noteText}>{noteText.slice(0, 60)}</span>
+                    {:else if resultItem}
                       <button
                         class="order-result-thumb"
                         title="Open result"
@@ -1536,6 +1548,10 @@
   .order-result-thumb img,
   .order-result-thumb video {
     @apply w-full h-full object-cover;
+  }
+
+  .order-result-note {
+    @apply flex-1 min-w-0 truncate text-[11px] text-zinc-400 italic;
   }
 
   /* Vision Round 3 — media-type toggle (image/video) in the job-node head. */
