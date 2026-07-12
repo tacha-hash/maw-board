@@ -31,7 +31,7 @@ use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use hmac::{Hmac, Mac as _};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
@@ -88,6 +88,16 @@ pub fn verify_account_password(password: &str, stored_phc: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// The at-rest representation of a connector bearer token: base64url of its
+/// SHA-256. Stored in `accounts.connector_token`; the server hashes a presented
+/// `Authorization: Bearer` token and looks it up. Unsalted SHA-256 is
+/// sufficient here (and lets us look up by value) precisely because a connector
+/// token is high-entropy random — unlike a low-entropy password, it isn't
+/// rainbow-tableable, so it needs no per-value salt or slow KDF.
+pub fn connector_token_hash(token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
 /// Mint a signed, stateless session cookie binding `account_id` for

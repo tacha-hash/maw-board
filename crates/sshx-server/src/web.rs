@@ -103,6 +103,7 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/boards", get(list_boards))
         .route("/boards/new", post(new_board))
         .route("/boards/{name}", delete(delete_board))
+        .route("/boards/{name}/key", get(board_key))
         .route("/boards/{name}/members", post(add_member))
         .route("/boards/{name}/members/{username}", delete(remove_member))
         .route("/healthz", get(healthz))
@@ -322,6 +323,58 @@ async fn require_board_owner(state: &ServerState, name: &str, account_id: &str) 
     matches!(state.accounts().board_owner(name).await, Ok(Some(owner)) if owner == account_id)
 }
 
+/// Board key endpoint (docs/vision-round5-key-via-api-contract.md). Replaces two
+/// same-host mechanisms: the browser reading the key from the URL fragment, and
+/// the connector reading the escrow `.key` file off a shared disk (which breaks
+/// once the server moves to a VPS).
+///
+/// Members get the read key (plus the write key when the board has one — none do
+/// in F0, so `write_key` is null). Connectors (bearer) additionally get a
+/// `join_token` so they can attach a backend; browsers deliberately don't —
+/// capability separation, so a shared-in member can view/edit but can't spawn a
+/// terminal. Both a non-member and a non-existent board return 404, so board
+/// names can't be enumerated.
+async fn board_key(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let not_found =
+        || (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": "not found"}))).into_response();
+
+    // Live membership — identical check for browser and connector.
+    if !matches!(state.accounts().is_member(&name, &account.account_id).await, Ok(true)) {
+        return not_found();
+    }
+
+    // The raw key lives only in the server-written escrow file — the Session
+    // keeps the derived encrypted-zeros block, not the key itself.
+    let Some(disk) = state.disk() else {
+        return not_found();
+    };
+    let escrow_path = disk.dir().join(format!("{name}.key"));
+    let key = match std::fs::read_to_string(&escrow_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("key").and_then(|k| k.as_str()).map(str::to_string))
+    {
+        Some(k) => k,
+        None => {
+            error!(board = %name, "board key escrow missing/unreadable for a member");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "board key unavailable").into_response();
+        }
+    };
+
+    // write_key is null in F0 (lobby boards carry no write password); emit it
+    // explicitly so the bridge's null-tolerant parse is satisfied.
+    let mut body = serde_json::json!({ "key": key, "write_key": serde_json::Value::Null });
+    if account.is_connector {
+        body["join_token"] =
+            serde_json::Value::String(crate::grpc::join_token(state.mac(), &name));
+    }
+    axum::Json(body).into_response()
+}
+
 async fn healthz(req: Request<Body>) -> Response {
     let host = req
         .headers()
@@ -348,13 +401,26 @@ async fn healthz(req: Request<Body>) -> Response {
 /// How long a browser session cookie stays valid.
 const SESSION_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 
-/// An authenticated account, extracted from the session claims the
+/// The authenticated identity behind a request, injected by
+/// [`session_auth_gate`]. `is_connector` distinguishes a programmatic caller
+/// (bearer connector-token) from a browser (session cookie) — the /key endpoint
+/// uses it to hand a `join_token` only to connectors (capability separation).
+#[derive(Clone)]
+struct AuthIdentity {
+    account_id: String,
+    is_connector: bool,
+}
+
+/// An authenticated account, extracted from the identity the
 /// [`session_auth_gate`] injected into the request. Handlers that need to know
 /// *who* is calling take this; the gate guarantees it's present for every
 /// non-public route, so the rejection here is only a defensive fallback.
 pub struct AuthedAccount {
     /// The authenticated account's id.
     pub account_id: String,
+    /// True when authenticated via a bearer connector-token rather than a
+    /// browser session cookie.
+    pub is_connector: bool,
 }
 
 impl FromRequestParts<Arc<ServerState>> for AuthedAccount {
@@ -366,20 +432,20 @@ impl FromRequestParts<Arc<ServerState>> for AuthedAccount {
     ) -> Result<Self, Self::Rejection> {
         parts
             .extensions
-            .get::<auth::SessionClaims>()
-            .map(|c| AuthedAccount {
-                account_id: c.account_id.clone(),
+            .get::<AuthIdentity>()
+            .map(|i| AuthedAccount {
+                account_id: i.account_id.clone(),
+                is_connector: i.is_connector,
             })
             .ok_or_else(|| (StatusCode::UNAUTHORIZED, "login required").into_response())
     }
 }
 
 /// Authentication + board-access middleware (replaces the old shared-password
-/// gate). Every route except the public allow-list requires a valid session;
-/// board-scoped routes additionally require live membership. Identity is proven
-/// by the session cookie (a Bearer connector-token path is added with the
-/// connector-auth unit); *authorization* to a board is always a fresh DB query,
-/// never trusted from the cookie (Le MUST-2).
+/// gate). Every route except the public allow-list requires an authenticated
+/// identity — a browser session cookie OR a bearer connector-token; board-scoped
+/// routes additionally require live membership. *Authorization* to a board is
+/// always a fresh DB query, never trusted from the credential (Le MUST-2).
 pub(crate) async fn session_auth_gate(
     State(state): State<Arc<ServerState>>,
     mut req: Request<Body>,
@@ -400,31 +466,59 @@ pub(crate) async fn session_auth_gate(
         return (StatusCode::FORBIDDEN, "bad origin").into_response();
     }
 
-    // Authentication: who is this?
-    let Some(claims) = session_from_headers(&state, req.headers()) else {
+    // Authentication: who is this? (cookie, else bearer connector-token)
+    let Some(identity) = resolve_identity(&state, req.headers()).await else {
         return unauthenticated_response(&method, req.uri());
     };
-    // The account must still exist (deleting an account revokes its sessions).
-    if !matches!(
-        state.accounts().account_exists(&claims.account_id).await,
-        Ok(true)
-    ) {
-        return unauthenticated_response(&method, req.uri());
-    }
 
     // Authorization for board-scoped routes: a live membership check, so
     // removing a share revokes access immediately.
     if let Some(board) = board_scope(&path) {
         if !matches!(
-            state.accounts().is_member(board, &claims.account_id).await,
+            state.accounts().is_member(board, &identity.account_id).await,
             Ok(true)
         ) {
             return board_forbidden_response(&method, &path);
         }
     }
 
-    req.extensions_mut().insert(claims);
+    req.extensions_mut().insert(identity);
     next.run(req).await
+}
+
+/// Resolve the authenticated identity from a request: prefer a browser session
+/// cookie, then fall back to an `Authorization: Bearer <connector-token>`. In
+/// both cases the account must still exist (deleting an account or rotating its
+/// token revokes access). Returns `None` when neither credential validates.
+async fn resolve_identity(state: &ServerState, headers: &HeaderMap) -> Option<AuthIdentity> {
+    if let Some(claims) = session_from_headers(state, headers) {
+        // A cookie for a since-deleted account is not valid.
+        return matches!(state.accounts().account_exists(&claims.account_id).await, Ok(true))
+            .then_some(AuthIdentity {
+                account_id: claims.account_id,
+                is_connector: false,
+            });
+    }
+    if let Some(token) = bearer_token(headers) {
+        let hash = auth::connector_token_hash(token);
+        if let Ok(Some(account_id)) = state.accounts().account_id_by_connector_token(&hash).await {
+            return Some(AuthIdentity {
+                account_id,
+                is_connector: true,
+            });
+        }
+    }
+    None
+}
+
+/// The bearer token from an `Authorization: Bearer <token>` header, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .filter(|t| !t.is_empty())
 }
 
 /// Paths reachable without a session: the auth pages/endpoints, logout (a no-op

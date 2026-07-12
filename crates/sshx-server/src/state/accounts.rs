@@ -115,6 +115,29 @@ impl AccountsDb {
         Ok(found.is_some())
     }
 
+    /// The account id owning a connector bearer token, looked up by the token's
+    /// at-rest hash (see [`crate::auth::connector_token_hash`]). `None` if no
+    /// account holds that token.
+    pub async fn account_id_by_connector_token(&self, token_hash: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM accounts WHERE connector_token = ?")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Set (or rotate) the connector token hash for an account, by username.
+    /// Returns `false` if no such username exists.
+    pub async fn set_connector_token(&self, username: &str, token_hash: &str) -> Result<bool> {
+        let res = sqlx::query("UPDATE accounts SET connector_token = ? WHERE username = ?")
+            .bind(token_hash)
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Directly create an account, bypassing the invite flow — for the
     /// `migrate-vr5` bootstrap of the "louis" account only (the chicken-egg:
     /// the very first account can't be created *through* an invite, since

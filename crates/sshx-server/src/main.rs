@@ -86,6 +86,9 @@ enum Command {
     /// One-time F0 migration: bootstrap the owner account and record ownership
     /// of every board already in the persist dir. Idempotent.
     MigrateVr5(MigrateArgs),
+    /// Mint (or rotate) an account's connector bearer token, printing the raw
+    /// token once. Store it as the connector's `CONNECTOR_TOKEN`.
+    ConnectorToken(ConnectorTokenArgs),
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -117,6 +120,17 @@ struct MigrateArgs {
     password: String,
 
     /// Username for the bootstrapped owner account.
+    #[clap(long, default_value = "louis")]
+    username: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct ConnectorTokenArgs {
+    /// Persist directory holding `accounts.db`.
+    #[clap(long, env = "SSHX_PERSIST_DIR")]
+    persist_dir: String,
+
+    /// Username of the (existing) account the token authenticates as.
     #[clap(long, default_value = "louis")]
     username: String,
 }
@@ -206,6 +220,28 @@ async fn run_migrate_vr5(args: MigrateArgs) -> Result<()> {
     Ok(())
 }
 
+#[tokio::main]
+async fn run_connector_token(args: ConnectorTokenArgs) -> Result<()> {
+    let db = AccountsDb::new(Some(&args.persist_dir)).await?;
+    // High-entropy random token; only its SHA-256 is stored server-side.
+    let token = sshx_core::rand_alphanumeric(32);
+    let hash = auth::connector_token_hash(&token);
+    if !db.set_connector_token(&args.username, &hash).await? {
+        return Err(anyhow!(
+            "no account '{}' — create it (or run `migrate-vr5`) first",
+            args.username
+        ));
+    }
+    // The raw token is shown exactly once, on stdout, for the connector's
+    // CONNECTOR_TOKEN env; the server keeps only its hash.
+    println!("{token}");
+    eprintln!(
+        "connector token minted for '{}' (shown once — set it as CONNECTOR_TOKEN)",
+        args.username
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
@@ -220,6 +256,7 @@ fn main() -> ExitCode {
             action: InviteAction::Create(a),
         }) => run_invite_create(a),
         Some(Command::MigrateVr5(a)) => run_migrate_vr5(a),
+        Some(Command::ConnectorToken(a)) => run_connector_token(a),
     };
 
     match result {
