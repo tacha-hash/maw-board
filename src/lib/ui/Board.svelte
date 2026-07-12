@@ -66,6 +66,10 @@
    * Session.svelte (order item vs. asset item) — same shape, different
    * source. */
   export let orderLinkPreview: { itemId: string; toWorld: [number, number] } | null = null;
+  /** Ids of board items currently marquee-selected (VR4). Session owns the
+   * selection (the marquee lives on its fabric); Board reads it to highlight
+   * members and to move the whole group when one member is dragged. */
+  export let selectedIds: Set<string> = new Set();
 
   // Screen-space snap distance; converted to world units (÷ zoom) so the pull
   // feels the same regardless of how far the board is zoomed.
@@ -130,6 +134,9 @@
      * reserves that agent as an assignee (read at Dispatch time, no
      * immediate bridge action — see design note). */
     orderLinkToShell: { orderId: string; shellId: number };
+    /** A drag started on a board item that isn't in the current selection —
+     * Session clears the marquee selection (VR4). */
+    clearSelection: void;
   }>();
 
   // ── Gen job node (image or video) — dataUrl is a JSON payload, not raw
@@ -482,6 +489,29 @@
   let dragPos = [0, 0];
   let rafPending = false;
 
+  // VR4 group drag: when the dragged anchor is part of the marquee selection,
+  // every selected member moves by the same delta. Records each member's
+  // starting position at drag start.
+  let draggingGroup = false;
+  let groupOrigins: Map<string, [number, number]> = new Map();
+
+  /** Move every group member by the anchor's current delta (or just the anchor
+   * when not a group drag). Called on each rAF tick and at drag end. */
+  function dispatchDragMove() {
+    if (dragId === null) return;
+    if (draggingGroup) {
+      const anchor = groupOrigins.get(dragId);
+      if (!anchor) return;
+      const dx = dragPos[0] - anchor[0];
+      const dy = dragPos[1] - anchor[1];
+      for (const [id, [ox, oy]] of groupOrigins) {
+        dispatch("move", { id, x: ox + dx, y: oy + dy });
+      }
+    } else {
+      dispatch("move", { id: dragId, x: dragPos[0], y: dragPos[1] });
+    }
+  }
+
   // Long-press state for mobile: hold ~400ms before drag activates.
   let pressTimer: ReturnType<typeof setTimeout> | null = null;
   let pressItem: BoardItem | null = null;
@@ -490,6 +520,10 @@
 
   function onPointerDown(event: PointerEvent, item: BoardItem) {
     if (hasWriteAccess === false) return;
+    // Mouse: only the LEFT button drags a node. Right-drag is the marquee
+    // gesture (VR4) — it must not move whatever node it happens to start on
+    // (this also fixes a latent bug where any mouse button moved a node).
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     // Keep the gesture on the item — don't let the canvas pan-handler also
     // claim it (caused touch drags to fight board panning).
     event.stopPropagation();
@@ -572,6 +606,21 @@
     dragPointerId = event.pointerId ?? null;
     dragOffset = [wx - item.x, wy - item.y];
     dragPos = [item.x, item.y];
+    // Group drag when the anchor is a selected member (with others). Dragging a
+    // NON-selected item instead clears the selection (single-item drag).
+    if (selectedIds.has(item.id) && selectedIds.size > 1) {
+      draggingGroup = true;
+      groupOrigins = new Map();
+      for (const it of items) {
+        if (selectedIds.has(it.id)) groupOrigins.set(it.id, [it.x, it.y]);
+      }
+    } else {
+      draggingGroup = false;
+      groupOrigins.clear();
+      if (!selectedIds.has(item.id) && selectedIds.size > 0) {
+        dispatch("clearSelection");
+      }
+    }
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", endDrag);
     window.addEventListener("pointercancel", endDrag);
@@ -600,18 +649,16 @@
       rafPending = true;
       requestAnimationFrame(() => {
         rafPending = false;
-        if (dragId !== null) {
-          dispatch("move", { id: dragId, x: dragPos[0], y: dragPos[1] });
-        }
+        dispatchDragMove();
       });
     }
   }
 
   function endDrag(event: PointerEvent) {
     if (event.pointerId !== dragPointerId) return;
-    if (dragId !== null) {
-      dispatch("move", { id: dragId, x: dragPos[0], y: dragPos[1] });
-    }
+    dispatchDragMove();
+    draggingGroup = false;
+    groupOrigins.clear();
     dragId = null;
     dragPointerId = null;
     longPressActive = false;
@@ -689,6 +736,7 @@
       class:is-note={item.kind === "note"}
       class:is-job={item.kind === "job"}
       class:is-order={item.kind === "order"}
+      class:is-selected={selectedIds.has(item.id)}
       style:width="{item.w}px"
       on:pointerdown={(event) => onPointerDown(event, item)}
     >
@@ -1309,6 +1357,11 @@
   .board-item {
     @apply relative rounded-lg overflow-hidden bg-zinc-900 shadow-lg cursor-move select-none;
     @apply ring-1 ring-zinc-700 transition-transform duration-150;
+  }
+
+  /* VR4 marquee selection — a bright amber ring so grouped nodes read as one. */
+  .board-item.is-selected {
+    @apply ring-2 ring-amber-400;
   }
 
   /* Snap guide lines — span well past the viewport so they read as full-length

@@ -1753,24 +1753,129 @@
     worldY: number;
   } | null = null;
 
-  function openContextMenu(event: MouseEvent) {
-    // Only trigger on empty canvas background, not bubbled from a terminal
-    // or board tile (those get their own interactions, not this menu).
-    if (event.target !== event.currentTarget) return;
-    event.preventDefault();
-    if (!canEdit) {
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  // ── VR4 marquee select + group (physical gestures) ──────────────────────
+  // left-drag = move (Board.svelte); right-drag on empty canvas = marquee;
+  // right-click (no drag) on empty canvas = New Node menu. The native
+  // `contextmenu` event is suppressed entirely (it fires at different moments
+  // on different OSes); the menu is driven from pointerup-without-drag instead.
+  let selectedIds = new Set<string>();
+  // Marquee rect while dragging, in SCREEN (client) coords for the overlay.
+  let marquee: { x: number; y: number; w: number; h: number } | null = null;
+  let rightPointer:
+    | { startX: number; startY: number; startPageX: number; startPageY: number; moved: boolean }
+    | null = null;
+  // px of movement before a right-drag counts as a marquee (not a click → menu)
+  // — a small floor so a shaky right-click still opens the menu (Le review).
+  const MARQUEE_THRESHOLD = 5;
+  // Board item kinds that are selectable/movable tiles (mirrors Board.svelte's
+  // render filter — excludes doc/lock/label/link/roster/... non-visual items).
+  const SELECTABLE_KINDS = new Set(["image", "video", "note", "job", "order", "stream"]);
+
+  function onFabricPointerDown(event: PointerEvent) {
+    if (event.target !== fabricEl) return; // only the empty canvas background
+    if (event.button === 2) {
+      // Right-button → begin the menu-or-marquee gesture.
+      rightPointer = {
+        startX: event.clientX,
+        startY: event.clientY,
+        startPageX: event.pageX,
+        startPageY: event.pageY,
+        moved: false,
+      };
+      window.addEventListener("pointermove", onRightPointerMove);
+      window.addEventListener("pointerup", onRightPointerUp);
+      window.addEventListener("pointercancel", onRightPointerCancel);
+    } else if (event.button === 0 && selectedIds.size > 0) {
+      // Left-click/pan on empty canvas clears the selection.
+      selectedIds = new Set();
+    }
+  }
+
+  function onRightPointerMove(event: PointerEvent) {
+    if (!rightPointer) return;
+    const dx = event.clientX - rightPointer.startX;
+    const dy = event.clientY - rightPointer.startY;
+    if (!rightPointer.moved && dx * dx + dy * dy > MARQUEE_THRESHOLD * MARQUEE_THRESHOLD) {
+      rightPointer.moved = true;
+    }
+    if (rightPointer.moved) {
+      marquee = {
+        x: Math.min(rightPointer.startX, event.clientX),
+        y: Math.min(rightPointer.startY, event.clientY),
+        w: Math.abs(dx),
+        h: Math.abs(dy),
+      };
+      // Live highlight of nodes inside the frame as it's dragged (Le review).
+      selectedIds = marqueeSelection(
+        rightPointer.startPageX,
+        rightPointer.startPageY,
+        event.pageX,
+        event.pageY,
+      );
+    }
+  }
+
+  function onRightPointerUp(event: PointerEvent) {
+    const rp = rightPointer;
+    cleanupRightPointer();
+    if (!rp) return;
+    if (rp.moved) {
+      selectedIds = marqueeSelection(rp.startPageX, rp.startPageY, event.pageX, event.pageY);
+    } else if (canEdit) {
+      // No drag → the New Node menu at the release point.
+      const [worldX, worldY] = normalizePosition(event);
+      contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
+    } else {
       makeToast({
         kind: "info",
         message: lockedForMe ? "Board is locked — read-only." : "Read-only — can't add nodes.",
       });
-      return;
     }
-    const [worldX, worldY] = normalizePosition(event);
-    contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
+    marquee = null;
   }
 
-  function closeContextMenu() {
-    contextMenu = null;
+  function onRightPointerCancel() {
+    cleanupRightPointer();
+    marquee = null;
+  }
+
+  function cleanupRightPointer() {
+    rightPointer = null;
+    window.removeEventListener("pointermove", onRightPointerMove);
+    window.removeEventListener("pointerup", onRightPointerUp);
+    window.removeEventListener("pointercancel", onRightPointerCancel);
+  }
+
+  /** Board items whose world bbox intersects the marquee rect (two screen
+   * corners given in page coords). */
+  function marqueeSelection(
+    pageX0: number,
+    pageY0: number,
+    pageX1: number,
+    pageY1: number,
+  ): Set<string> {
+    const [wx0, wy0] = normalizePosition({ pageX: pageX0, pageY: pageY0 } as MouseEvent);
+    const [wx1, wy1] = normalizePosition({ pageX: pageX1, pageY: pageY1 } as MouseEvent);
+    const rx0 = Math.min(wx0, wx1);
+    const rx1 = Math.max(wx0, wx1);
+    const ry0 = Math.min(wy0, wy1);
+    const ry1 = Math.max(wy0, wy1);
+    const sel = new Set<string>();
+    for (const it of boardItems) {
+      if (!SELECTABLE_KINDS.has(it.kind)) continue;
+      if (it.x < rx1 && it.x + it.w > rx0 && it.y < ry1 && it.y + it.h > ry0) {
+        sel.add(it.id);
+      }
+    }
+    return sel;
+  }
+
+  function clearSelection() {
+    if (selectedIds.size > 0) selectedIds = new Set();
   }
 
   // Shared markdown document — a singleton board item synced to all peers
@@ -3006,7 +3111,8 @@
   <div
     class="absolute inset-0 overflow-hidden touch-none"
     bind:this={fabricEl}
-    on:contextmenu={openContextMenu}
+    on:pointerdown={onFabricPointerDown}
+    on:contextmenu={(event) => event.preventDefault()}
   >
     <Board
       items={boardItems}
@@ -3021,6 +3127,8 @@
       {snapTargets}
       extraGuidesV={termGuidesV}
       extraGuidesH={termGuidesH}
+      {selectedIds}
+      on:clearSelection={clearSelection}
       bind:dropTargetShellId
       bind:assetLinkPreview
       on:move={({ detail }) =>
@@ -3046,6 +3154,18 @@
       on:orderDispatch={({ detail }) => handleOrderDispatch(detail)}
       on:orderLinkToShell={({ detail }) => handleOrderLinkToShell(detail.orderId, detail.shellId)}
     />
+
+    {#if marquee}
+      <!-- VR4 marquee overlay — screen coords, so it rides the viewport, not
+           the pan/zoom fabric. Dashed amber frame so the gesture "feels". -->
+      <div
+        class="pointer-events-none fixed z-40 rounded-sm border-2 border-dashed border-amber-400 bg-amber-400/10"
+        style:left="{marquee.x}px"
+        style:top="{marquee.y}px"
+        style:width="{marquee.w}px"
+        style:height="{marquee.h}px"
+      ></div>
+    {/if}
 
     {#if contextMenu}
       {@const menu = contextMenu}
