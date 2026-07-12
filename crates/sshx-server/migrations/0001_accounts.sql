@@ -12,6 +12,12 @@ CREATE TABLE accounts (
     -- programmatic clients — separate from the browser's session cookie.
     -- Nullable/unset until an account requests one (F0 task 3, key-via-API).
     connector_token TEXT UNIQUE,
+    -- Session epoch: bumped on "logout everywhere" / password change. A cookie
+    -- is valid only while its signed issued_at >= this. Not checked in F0 —
+    -- prepared now (same pattern as connector_token) so the future check is a
+    -- free comparison riding the per-request board-access DB read, with no
+    -- second migration (Le review future-proof, 2026-07-12).
+    session_epoch INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL
 );
 
@@ -37,9 +43,11 @@ CREATE TABLE board_members (
     PRIMARY KEY (board_name, account_id)
 );
 
--- F1 prep — not queried by F0 code, but backfilled during the F0 migration
--- (all existing backends -> account "louis") so F1 doesn't need a second
--- migration pass just to populate this table.
+-- F1 prep — not queried by F0 code. Backends are runtime state (the bridge
+-- spawns them per run; they aren't persisted on disk), so nothing is
+-- backfilled here at migration time — this table is populated at runtime via
+-- register_backend() once per-shell ownership lands (F1). Declared now so F1
+-- needs no second schema migration just to add it. (Le review, 2026-07-12.)
 CREATE TABLE backend_owners (
     board_name    TEXT NOT NULL,
     backend_id    INTEGER NOT NULL,   -- matches sshx_core::BackendId

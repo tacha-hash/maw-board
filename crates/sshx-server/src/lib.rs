@@ -22,6 +22,7 @@ use utils::Shutdown;
 
 use crate::state::ServerState;
 
+pub mod auth;
 pub mod grpc;
 mod listen;
 pub mod session;
