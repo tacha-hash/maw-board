@@ -37,6 +37,7 @@ async fn test_two_backends_join_same_session() -> Result<()> {
         &join_token,
         &key,
         "second-node",
+        None,
         Runner::Echo,
     )
     .await

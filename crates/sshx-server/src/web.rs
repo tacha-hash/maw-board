@@ -586,6 +586,31 @@ fn session_from_headers(state: &ServerState, headers: &HeaderMap) -> Option<auth
     auth::verify_session_cookie(state.mac(), cookie)
 }
 
+/// The board WebSocket connect gate (VR5 exposure-gate item 1): the caller must
+/// present a valid session cookie for an existing account that is a live member
+/// of `board`. Returns the account id to enforce per-shell ownership on, or an
+/// error response to fail the upgrade with. Connectors don't open the browser
+/// WS (they Join via gRPC), so cookie-only is correct here.
+pub(crate) async fn ws_connect_gate(
+    state: &ServerState,
+    headers: &HeaderMap,
+    board: &str,
+) -> Result<String, Response> {
+    let Some(claims) = session_from_headers(state, headers) else {
+        return Err((StatusCode::UNAUTHORIZED, "login required").into_response());
+    };
+    if !matches!(
+        state.accounts().account_exists(&claims.account_id).await,
+        Ok(true)
+    ) {
+        return Err((StatusCode::UNAUTHORIZED, "login required").into_response());
+    }
+    match state.accounts().is_member(board, &claims.account_id).await {
+        Ok(true) => Ok(claims.account_id),
+        _ => Err((StatusCode::FORBIDDEN, "not a member of this board").into_response()),
+    }
+}
+
 /// Response for an unauthenticated request: redirect browser GET navigation to
 /// the login page (preserving where they were headed), 401 for API/non-GET.
 fn unauthenticated_response(method: &Method, uri: &Uri) -> Response {

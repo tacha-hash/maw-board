@@ -6,7 +6,6 @@ use axum::extract::{
     ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     Path, State,
 };
-use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::SinkExt;
 use sshx_core::proto::{server_update::ServerMessage, NewShell, TerminalInput, TerminalSize};
@@ -22,15 +21,22 @@ use crate::ServerState;
 
 pub async fn get_session_ws(
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<Arc<ServerState>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // VR5 connect gate: must be a logged-in member of this board before we
+    // upgrade. Non-members / logged-out callers never reach the socket.
+    let account_id = match crate::web::ws_connect_gate(&state, &headers, &name).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
     ws.on_upgrade(move |mut socket| {
         let span = info_span!("ws", %name);
         async move {
             match state.frontend_connect(&name).await {
                 Ok(Ok(session)) => {
-                    if let Err(err) = handle_socket(&mut socket, session).await {
+                    if let Err(err) = handle_socket(&mut socket, session, Some(account_id)).await {
                         warn!(?err, "websocket exiting early");
                     } else {
                         socket.close().await.ok();
@@ -70,7 +76,22 @@ pub async fn get_session_ws(
 }
 
 /// Handle an incoming live WebSocket connection to a given session.
-async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<()> {
+/// Whether the connected account may mutate shell `id` (type / resize / close).
+/// A member may *view* any shell on a board they're in, but may only mutate a
+/// shell owned by their own account's backend (VR5 per-shell ownership). An
+/// un-owned shell (`None` — legacy/local board) is unrestricted.
+fn may_mutate_shell(session: &Session, account: &Option<String>, id: Sid) -> bool {
+    match session.shell_owner(id) {
+        None => true,
+        Some(owner) => account.as_deref() == Some(owner.as_str()),
+    }
+}
+
+async fn handle_socket(
+    socket: &mut WebSocket,
+    session: Arc<Session>,
+    account: Option<String>,
+) -> Result<()> {
     /// Send a message to the client over WebSocket.
     async fn send(socket: &mut WebSocket, msg: WsServer) -> Result<()> {
         let mut buf = Vec::new();
@@ -205,6 +226,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
+                if !may_mutate_shell(&session, &account, id) {
+                    send(socket, WsServer::Error("not your terminal".into())).await?;
+                    continue;
+                }
                 match session.shell_backend(id) {
                     Some(b) if session.backend_connected(b) => {
                         let Some(update_tx) = session.backend_sender(b) else {
@@ -231,6 +256,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
+                if !may_mutate_shell(&session, &account, id) {
+                    send(socket, WsServer::Error("not your terminal".into())).await?;
+                    continue;
+                }
                 if let Err(err) = session.move_shell(id, winsize) {
                     send(socket, WsServer::Error(err.to_string())).await?;
                     continue;
@@ -249,6 +278,11 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
             WsClient::Data(id, data, offset) => {
                 if let Err(e) = session.check_write_permission(user_id) {
                     send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                // VR5 per-shell ownership: only the owning account may type in.
+                if !may_mutate_shell(&session, &account, id) {
+                    send(socket, WsServer::Error("not your terminal".into())).await?;
                     continue;
                 }
                 let Some(update_tx) = session.shell_backend(id).and_then(|b| session.backend_sender(b)) else {

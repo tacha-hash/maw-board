@@ -99,6 +99,12 @@ struct BackendChannel {
     /// "primary" registration or Join()'s `backend_name`.
     name: String,
 
+    /// The account that owns this backend (VR5 per-shell ownership). `None` for
+    /// legacy/local backends (no connector token). Set at Join time and, after
+    /// a restart, rehydrated from the `backend_owners` table (a `Channel()`
+    /// reconnect carries only a backend id + token, not the connector token).
+    owner_account_id: Option<String>,
+
     /// Whether a `Channel()` stream currently holds this backend's receiver.
     /// Prevents a second concurrent connection for the same backend_id from
     /// racing on the same receiver (see docs/phase3-design.md's MPMC finding).
@@ -225,26 +231,47 @@ impl Session {
 
     /// Register a new backend (via `Open()` for the primary, or `Join()` for
     /// any other), allocating a fresh `BackendId` and message channel.
-    pub fn register_backend(&self, name: String) -> BackendId {
+    /// `owner_account_id` is the account that owns this backend's shells (VR5),
+    /// or `None` for a legacy/local backend.
+    pub fn register_backend(&self, name: String, owner_account_id: Option<String>) -> BackendId {
         let id = self.counter.next_backend_id();
-        self.restore_backend(id, name);
+        self.restore_backend(id, name, owner_account_id);
         id
     }
 
     /// Register a backend under a SPECIFIC, already-allocated ID — used only
     /// when restoring from a snapshot, where backend identities must be
-    /// preserved exactly so already-connected clients can still reconnect.
-    pub fn restore_backend(&self, id: BackendId, name: String) {
+    /// preserved exactly so already-connected clients can still reconnect. The
+    /// snapshot doesn't carry owners; they're rehydrated separately via
+    /// [`set_backend_owner`](Self::set_backend_owner).
+    pub fn restore_backend(&self, id: BackendId, name: String, owner_account_id: Option<String>) {
         let (update_tx, update_rx) = async_channel::bounded(256);
         self.backends.write().insert(
             id,
             BackendChannel {
                 name,
+                owner_account_id,
                 connected: Mutex::new(false),
                 update_tx,
                 update_rx,
             },
         );
+    }
+
+    /// Set (rehydrate) a backend's owning account after a snapshot restore.
+    /// No-op if the backend id isn't registered.
+    pub fn set_backend_owner(&self, id: BackendId, owner_account_id: String) {
+        if let Some(backend) = self.backends.write().get_mut(&id) {
+            backend.owner_account_id = Some(owner_account_id);
+        }
+    }
+
+    /// The account owning the backend that hosts shell `id`, if any. Used by
+    /// the WS layer to enforce that only the owning account can type into /
+    /// resize / close a shell (VR5 per-shell ownership).
+    pub fn shell_owner(&self, id: Sid) -> Option<String> {
+        let backend_id = self.shell_backend(id)?;
+        self.backends.read().get(&backend_id)?.owner_account_id.clone()
     }
 
     /// List all registered backends (id, name) — used for the snapshot and

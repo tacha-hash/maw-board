@@ -8,7 +8,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
-use sshx_core::rand_alphanumeric;
+use sshx_core::{rand_alphanumeric, BackendId};
 use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::error;
@@ -205,6 +205,24 @@ impl ServerState {
         self.close_session(name).await
     }
 
+    /// Restore a session from a snapshot and rehydrate per-shell backend
+    /// ownership from the `backend_owners` table (owners aren't in the snapshot;
+    /// a `Channel()` reconnect after restart wouldn't re-present the connector
+    /// token, so without this per-shell enforcement would silently lapse across
+    /// a restart).
+    async fn restore_and_rehydrate(&self, name: &str, snapshot: &[u8]) -> Result<Arc<Session>> {
+        let session = Arc::new(Session::restore(snapshot)?);
+        match self.accounts.backend_owners(name).await {
+            Ok(owners) => {
+                for (backend_id, account_id) in owners {
+                    session.set_backend_owner(BackendId(backend_id), account_id);
+                }
+            }
+            Err(err) => error!(?err, board = %name, "failed to rehydrate backend owners"),
+        }
+        Ok(session)
+    }
+
     /// Connect to a session by name from the `sshx` client, which provides the
     /// actual terminal backend.
     pub async fn backend_connect(&self, name: &str) -> Result<Option<Arc<Session>>> {
@@ -215,7 +233,7 @@ impl ServerState {
         if let Some(mesh) = &self.mesh {
             let (owner, snapshot) = mesh.get_owner_snapshot(name).await?;
             if let Some(snapshot) = snapshot {
-                let session = Arc::new(Session::restore(&snapshot)?);
+                let session = self.restore_and_rehydrate(name, &snapshot).await?;
                 self.insert(name, session.clone());
                 if let Some(owner) = owner {
                     mesh.notify_transfer(name, &owner).await?;
@@ -226,7 +244,7 @@ impl ServerState {
 
         if let Some(disk) = &self.disk {
             if let Some(snapshot) = disk.load(name) {
-                let session = Arc::new(Session::restore(&snapshot)?);
+                let session = self.restore_and_rehydrate(name, &snapshot).await?;
                 self.insert(name, session.clone());
                 return Ok(Some(session));
             }
@@ -247,7 +265,7 @@ impl ServerState {
         // Wake a sleeping board from disk before consulting the mesh.
         if let Some(disk) = &self.disk {
             if let Some(snapshot) = disk.load(name) {
-                let session = Arc::new(Session::restore(&snapshot)?);
+                let session = self.restore_and_rehydrate(name, &snapshot).await?;
                 self.insert(name, session.clone());
                 return Ok(Ok(session));
             }

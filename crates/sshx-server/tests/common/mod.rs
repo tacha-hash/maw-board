@@ -78,6 +78,27 @@ impl TestServer {
     pub fn state(&self) -> Arc<ServerState> {
         self.server.state()
     }
+
+    /// Create `username` (if new), make it a member of `board` (creating the
+    /// board's ownership record if new), and return a full `name=value` session
+    /// cookie for it — everything a WS client needs to pass the VR5 connect
+    /// gate. Distinct usernames yield distinct member accounts on the same board.
+    pub async fn member_cookie(&self, username: &str, board: &str) -> String {
+        let state = self.server.state();
+        let hash = sshx_server::auth::hash_account_password("test-pw").unwrap();
+        let account = state
+            .accounts()
+            .bootstrap_account(username, &hash)
+            .await
+            .unwrap();
+        state
+            .accounts()
+            .create_board(board, &account.id)
+            .await
+            .unwrap();
+        let value = sshx_server::auth::mint_session_cookie(state.mac(), &account.id, 3600);
+        format!("{}={}", sshx_server::auth::SESSION_COOKIE, value)
+    }
 }
 
 impl Drop for TestServer {
@@ -101,9 +122,22 @@ pub struct ClientSocket {
 }
 
 impl ClientSocket {
-    /// Connect to a WebSocket endpoint.
-    pub async fn connect(uri: &str, key: &str, write_password: Option<&str>) -> Result<Self> {
-        let (stream, resp) = tokio_tungstenite::connect_async(uri).await?;
+    /// Connect to a WebSocket endpoint. `cookie` is the full `name=value`
+    /// session cookie for the VR5 connect gate (see
+    /// [`TestServer::member_cookie`]); `None` connects unauthenticated, which
+    /// the gate now rejects.
+    pub async fn connect(
+        uri: &str,
+        key: &str,
+        write_password: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Result<Self> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = uri.into_client_request()?;
+        if let Some(cookie) = cookie {
+            request.headers_mut().insert("cookie", cookie.parse()?);
+        }
+        let (stream, resp) = tokio_tungstenite::connect_async(request).await?;
         ensure!(resp.status() == StatusCode::SWITCHING_PROTOCOLS);
 
         let mut this = Self {

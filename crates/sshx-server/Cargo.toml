@@ -50,5 +50,6 @@ tracing-subscriber.workspace = true
 zstd = "0.12.4"
 
 [dev-dependencies]
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "cookies"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
+serde_json = "1.0"
 sshx = { path = "../sshx" }

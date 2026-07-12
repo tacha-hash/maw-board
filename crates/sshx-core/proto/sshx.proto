@@ -62,6 +62,10 @@ message JoinRequest {
   string join_token = 3;     // From OpenResponse.join_token — authorizes joining.
   bytes encrypted_zeros = 4; // MUST match the session's stored value (same encryption key).
   string backend_name = 5;   // Human-readable label for this backend (e.g. hostname).
+  // VR5 F0: the connector's bearer token, identifying the account that OWNS
+  // this backend (its shells). Absent = legacy/local (owner unrestricted).
+  // Present but not resolvable to an account = rejected (fail closed).
+  optional string connector_token = 6;
 }
 
 // Details of a successful join.

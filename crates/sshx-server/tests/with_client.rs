@@ -62,11 +62,23 @@ async fn test_ws_missing() -> Result<()> {
     let server = TestServer::new().await;
 
     let bad_endpoint = format!("ws://{}/not/an/endpoint", server.local_addr());
-    assert!(ClientSocket::connect(&bad_endpoint, "", None)
+    assert!(ClientSocket::connect(&bad_endpoint, "", None, None)
         .await
         .is_err());
 
-    let mut s = ClientSocket::connect(&server.ws_endpoint("foobar"), "", None).await?;
+    // Unauthenticated (no session cookie) → the VR5 connect gate rejects the
+    // upgrade before it ever reaches the session lookup.
+    assert!(
+        ClientSocket::connect(&server.ws_endpoint("foobar"), "", None, None)
+            .await
+            .is_err()
+    );
+
+    // Authenticated member of the (nonexistent) board → past the gate, then the
+    // session-not-found close.
+    let cookie = server.member_cookie("u", "foobar").await;
+    let mut s =
+        ClientSocket::connect(&server.ws_endpoint("foobar"), "", None, Some(&cookie)).await?;
     s.expect_close(4404).await;
 
     Ok(())
@@ -81,7 +93,9 @@ async fn test_ws_basic() -> Result<()> {
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
 
-    let mut s = ClientSocket::connect(&server.ws_endpoint(&name), &key, None).await?;
+    let cookie = server.member_cookie("u", &name).await;
+    let mut s =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&cookie)).await?;
     s.flush().await;
     assert_eq!(s.user_id, Uid(1));
 
@@ -113,7 +127,9 @@ async fn test_ws_resize() -> Result<()> {
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
 
-    let mut s = ClientSocket::connect(&server.ws_endpoint(&name), &key, None).await?;
+    let cookie = server.member_cookie("u", &name).await;
+    let mut s =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&cookie)).await?;
 
     s.send(WsClient::Move(Sid(1), None)).await; // error: does not exist yet!
     s.flush().await;
@@ -159,16 +175,17 @@ async fn test_users_join() -> Result<()> {
     tokio::spawn(async move { controller.run().await });
 
     let endpoint = server.ws_endpoint(&name);
-    let mut s1 = ClientSocket::connect(&endpoint, &key, None).await?;
+    let cookie = server.member_cookie("u", &name).await;
+    let mut s1 = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
     s1.flush().await;
     assert_eq!(s1.users.len(), 1);
 
-    let mut s2 = ClientSocket::connect(&endpoint, &key, None).await?;
+    let mut s2 = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
     s2.flush().await;
     assert_eq!(s2.users.len(), 2);
 
     drop(s2);
-    let mut s3 = ClientSocket::connect(&endpoint, &key, None).await?;
+    let mut s3 = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
     s3.flush().await;
     assert_eq!(s3.users.len(), 2);
 
@@ -188,7 +205,8 @@ async fn test_users_metadata() -> Result<()> {
     tokio::spawn(async move { controller.run().await });
 
     let endpoint = server.ws_endpoint(&name);
-    let mut s = ClientSocket::connect(&endpoint, &key, None).await?;
+    let cookie = server.member_cookie("u", &name).await;
+    let mut s = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
     s.flush().await;
     assert_eq!(s.users.len(), 1);
     assert_eq!(s.users.get(&s.user_id).unwrap().cursor, None);
@@ -213,8 +231,9 @@ async fn test_chat_messages() -> Result<()> {
     tokio::spawn(async move { controller.run().await });
 
     let endpoint = server.ws_endpoint(&name);
-    let mut s1 = ClientSocket::connect(&endpoint, &key, None).await?;
-    let mut s2 = ClientSocket::connect(&endpoint, &key, None).await?;
+    let cookie = server.member_cookie("u", &name).await;
+    let mut s1 = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
+    let mut s2 = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
 
     s1.send(WsClient::SetName("billy".into())).await;
     s1.send(WsClient::Chat("hello there!".into())).await;
@@ -227,7 +246,7 @@ async fn test_chat_messages() -> Result<()> {
         (s1.user_id, "billy".into(), "hello there!".into())
     );
 
-    let mut s3 = ClientSocket::connect(&endpoint, &key, None).await?;
+    let mut s3 = ClientSocket::connect(&endpoint, &key, None, Some(&cookie)).await?;
     s3.flush().await;
     assert_eq!(s1.messages.len(), 1);
     assert_eq!(s3.messages.len(), 0);
@@ -255,9 +274,15 @@ async fn test_read_write_permissions() -> Result<()> {
         .nth(1)
         .expect("Write URL should contain password");
 
+    let cookie = server.member_cookie("u", &name).await;
     // connect with write access
-    let mut writer =
-        ClientSocket::connect(&server.ws_endpoint(&name), &key, Some(write_password)).await?;
+    let mut writer = ClientSocket::connect(
+        &server.ws_endpoint(&name),
+        &key,
+        Some(write_password),
+        Some(&cookie),
+    )
+    .await?;
     writer.flush().await;
 
     // test write permissions
@@ -271,7 +296,8 @@ async fn test_read_write_permissions() -> Result<()> {
     assert!(writer.errors.is_empty(), "Writer should not receive errors");
 
     // connect with read-only access
-    let mut reader = ClientSocket::connect(&server.ws_endpoint(&name), &key, None).await?;
+    let mut reader =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&cookie)).await?;
     reader.flush().await;
 
     // test read-only restrictions
@@ -285,6 +311,117 @@ async fn test_read_write_permissions() -> Result<()> {
         reader.shells.len(),
         1,
         "Reader should still see the existing shell"
+    );
+
+    Ok(())
+}
+
+/// VR5 per-shell ownership (the exposure-gate negative test): a member of a
+/// board who is NOT the account owning a shell's backend cannot type into that
+/// shell — the server rejects `WsClient::Data` at the protocol layer, and the
+/// input is never applied. The owner, meanwhile, types freely.
+#[tokio::test]
+async fn test_cross_account_shell_write_rejected() -> Result<()> {
+    let mut options = ServerOptions::default();
+    options.insecure_cookies = true; // plain-HTTP test login
+    let server = TestServer::new_with_options(options).await;
+    let state = server.state();
+
+    // Accounts: alice owns a board + its backend; bob is a member.
+    let a_hash = sshx_server::auth::hash_account_password("pw-alice").unwrap();
+    let alice = state.accounts().bootstrap_account("alice", &a_hash).await?;
+    let b_hash = sshx_server::auth::hash_account_password("pw-bob").unwrap();
+    let bob = state.accounts().bootstrap_account("bob", &b_hash).await?;
+
+    // Alice's connector token (what her backend authenticates with).
+    let alice_token = "alice-connector-token-abc123";
+    state
+        .accounts()
+        .set_connector_token("alice", &sshx_server::auth::connector_token_hash(alice_token))
+        .await?;
+
+    // Alice creates a board over HTTP (owner=alice, no backend yet).
+    let base = format!("http://{}", server.local_addr());
+    let http = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    http.post(format!("{base}/login"))
+        .form(&[("username", "alice"), ("password", "pw-alice")])
+        .send()
+        .await?;
+    let nb: serde_json::Value = http
+        .post(format!("{base}/api/boards/new"))
+        .json(&serde_json::json!({ "name": "neg" }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let name = nb["name"].as_str().unwrap().to_string();
+    let key = nb["key"].as_str().unwrap().to_string();
+    let join_token = nb["join_token"].as_str().unwrap().to_string();
+
+    // Alice's backend joins with her connector token → the server records the
+    // backend (and thus its shells) as owned by alice.
+    let mut backend = Controller::join(
+        &server.endpoint(),
+        &name,
+        &join_token,
+        &key,
+        "alice-backend",
+        Some(alice_token),
+        Runner::Echo,
+    )
+    .await
+    .context("alice backend join failed")?;
+    tokio::spawn(async move { backend.run().await });
+
+    // Bob is a member of the board (can view, per the connect gate).
+    assert!(state.accounts().add_member_by_username(&name, "bob").await?);
+
+    let alice_cookie = format!(
+        "{}={}",
+        sshx_server::auth::SESSION_COOKIE,
+        sshx_server::auth::mint_session_cookie(state.mac(), &alice.id, 3600)
+    );
+    let bob_cookie = format!(
+        "{}={}",
+        sshx_server::auth::SESSION_COOKIE,
+        sshx_server::auth::mint_session_cookie(state.mac(), &bob.id, 3600)
+    );
+
+    // Alice (owner) creates a shell on her backend and types into it — allowed.
+    let mut sa =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&alice_cookie)).await?;
+    sa.send(WsClient::Create(0, 0)).await;
+    sa.flush().await;
+    assert_eq!(sa.shells.len(), 1, "alice created a shell");
+    sa.send(WsClient::Subscribe(Sid(1), 0)).await;
+    sa.send_input(Sid(1), b"hi from alice").await;
+    sa.flush().await;
+    assert_eq!(sa.read(Sid(1)), "hi from alice", "owner may type");
+    assert!(sa.errors.is_empty(), "owner should get no error");
+
+    // Bob (member, not the shell's owner) tries to type into alice's shell.
+    let mut sb =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&bob_cookie)).await?;
+    sb.flush().await;
+    assert!(sb.shells.contains_key(&Sid(1)), "bob can VIEW the shell");
+    sb.send_input(Sid(1), b"evil from bob").await;
+    sb.flush().await;
+    assert!(
+        sb.errors.iter().any(|e| e.contains("not your terminal")),
+        "bob's write into alice's shell must be rejected, got errors: {:?}",
+        sb.errors
+    );
+
+    // And bob's input must NOT have reached the terminal — alice's view is
+    // unchanged (no "evil from bob" echoed back).
+    sa.flush().await;
+    assert_eq!(
+        sa.read(Sid(1)),
+        "hi from alice",
+        "rejected input must not be applied to the shell"
     );
 
     Ok(())

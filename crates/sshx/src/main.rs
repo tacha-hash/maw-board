@@ -53,6 +53,12 @@ struct Args {
     /// user@hostname, same as --name).
     #[clap(long)]
     backend_name: Option<String>,
+
+    /// Connector bearer token identifying the account that owns this backend
+    /// (VR5). Set by the oracle connector in remote mode; the server rejects
+    /// the join if it's present but unrecognized. Omit for local/legacy joins.
+    #[clap(long, env = "CONNECTOR_TOKEN")]
+    connector_token: Option<String>,
 }
 
 fn print_greeting(shell: &str, controller: &Controller) {
@@ -131,6 +137,7 @@ async fn start(args: Args) -> Result<()> {
                 args.join_token.as_deref().expect("clap requires_all"),
                 args.encryption_key.as_deref().expect("clap requires_all"),
                 &backend_name,
+                args.connector_token.as_deref(),
                 runner,
             )
             .await?

@@ -135,6 +135,7 @@ impl Controller {
         join_token: &str,
         encryption_key: &str,
         backend_name: &str,
+        connector_token: Option<&str>,
         runner: Runner,
     ) -> Result<Self> {
         debug!(%origin, %join_name, "joining existing session");
@@ -147,6 +148,7 @@ impl Controller {
             join_token: join_token.into(),
             encrypted_zeros: encrypt.zeros().into(),
             backend_name: backend_name.into(),
+            connector_token: connector_token.map(|t| t.to_string()),
         };
         let resp = client.join(req).await?.into_inner();
 

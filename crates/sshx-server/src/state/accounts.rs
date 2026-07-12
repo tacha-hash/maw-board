@@ -267,11 +267,15 @@ impl AccountsDb {
         Ok(())
     }
 
-    /// Forget a board entirely: drop its membership rows and its ownership row.
-    /// Called when a board is permanently deleted.
+    /// Forget a board entirely: drop its membership rows, ownership row, and
+    /// backend-owner rows. Called when a board is permanently deleted.
     pub async fn forget_board(&self, name: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM board_members WHERE board_name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM backend_owners WHERE board_name = ?")
             .bind(name)
             .execute(&mut *tx)
             .await?;
@@ -281,6 +285,39 @@ impl AccountsDb {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Persist a backend's owning account so per-shell ownership survives a
+    /// server restart (a `Channel()` reconnect doesn't re-present the connector
+    /// token). Keyed on (board, backend_id); re-registering the same id
+    /// replaces the row.
+    pub async fn set_backend_owner(
+        &self,
+        board_name: &str,
+        backend_id: u32,
+        account_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO backend_owners (board_name, backend_id, account_id) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(board_name)
+        .bind(backend_id as i64)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The (backend_id, account_id) owners recorded for a board, used to
+    /// rehydrate backend ownership after a snapshot restore.
+    pub async fn backend_owners(&self, board_name: &str) -> Result<Vec<(u32, String)>> {
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT backend_id, account_id FROM backend_owners WHERE board_name = ?")
+                .bind(board_name)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id, acc)| (id as u32, acc)).collect())
     }
 
     /// The owning account id of a board, if the board is tracked.

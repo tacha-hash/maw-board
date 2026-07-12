@@ -62,7 +62,11 @@ impl SshxService for GrpcServer {
                     write_password_hash: request.write_password_hash,
                 };
                 let session = Session::new(metadata);
-                let backend_id = session.register_backend("primary".to_string());
+                // A directly-Open()'d session's primary backend has no owning
+                // account (legacy path — F0 boards are created via HTTP and
+                // Join()'d). Its shells stay unrestricted; such boards have no
+                // membership rows, so the WS connect gate keeps them off the web.
+                let backend_id = session.register_backend("primary".to_string(), None);
                 debug_assert_eq!(backend_id, BackendId::PRIMARY);
                 self.0.insert(&name, Arc::new(session));
             }
@@ -107,7 +111,39 @@ impl SshxService for GrpcServer {
         } else {
             request.backend_name
         };
-        let backend_id = session.register_backend(backend_name);
+
+        // Resolve the owning account (VR5 per-shell ownership). Absent token =
+        // legacy/local backend, owner unrestricted. Present-but-unresolvable =
+        // a failed authentication attempt: reject the join, loudly, rather than
+        // silently downgrading to an un-owned (writable-by-any-member) backend.
+        let owner_account_id = match request.connector_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let hash = crate::auth::connector_token_hash(token);
+                match self.0.accounts().account_id_by_connector_token(&hash).await {
+                    Ok(Some(id)) => Some(id),
+                    Ok(None) => return Err(Status::unauthenticated("connector_token invalid")),
+                    Err(err) => {
+                        error!(?err, "connector_token lookup failed");
+                        return Err(Status::internal("connector token lookup failed"));
+                    }
+                }
+            }
+        };
+
+        let backend_id = session.register_backend(backend_name, owner_account_id.clone());
+        // Persist ownership so it survives a restart (reconnect goes through
+        // Channel(), which doesn't re-present the connector token).
+        if let Some(account_id) = owner_account_id {
+            if let Err(err) = self
+                .0
+                .accounts()
+                .set_backend_owner(&request.name, backend_id.0, &account_id)
+                .await
+            {
+                error!(?err, "failed to persist backend owner");
+            }
+        }
         let token = backend_token(self.0.mac(), &request.name, backend_id);
         info!(name = %request.name, %backend_id, "backend joined session");
         Ok(Response::new(JoinResponse { backend_id: backend_id.0, token }))

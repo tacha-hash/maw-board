@@ -111,7 +111,9 @@ impl Session {
         // messages' *destinations* must line up when those backends
         // reconnect).
         for (id, name) in message.backend_names {
-            session.restore_backend(BackendId(id), name);
+            // Owners aren't in the snapshot — the caller rehydrates them from
+            // the backend_owners table after restore (see state.rs).
+            session.restore_backend(BackendId(id), name, None);
         }
         session.counter.set_backend_counter(message.next_backend_id);
 
