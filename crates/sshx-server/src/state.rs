@@ -13,11 +13,13 @@ use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::error;
 
+use self::accounts::AccountsDb;
 use self::disk::StorageDisk;
 use self::mesh::StorageMesh;
 use crate::session::Session;
 use crate::ServerOptions;
 
+pub mod accounts;
 pub mod disk;
 pub mod mesh;
 
@@ -53,11 +55,14 @@ pub struct ServerState {
 
     /// Path to the directory containing static assets.
     static_dir: String,
+
+    /// Account/invite/board-ownership database (Vision Round 5 F0).
+    accounts: AccountsDb,
 }
 
 impl ServerState {
     /// Create an empty server state using the given secret.
-    pub fn new(options: ServerOptions) -> Result<Self> {
+    pub async fn new(options: ServerOptions) -> Result<Self> {
         let secret = options.secret.unwrap_or_else(|| rand_alphanumeric(22));
         let mesh = match options.redis_url {
             Some(url) => Some(StorageMesh::new(&url, options.host.as_deref())?),
@@ -73,6 +78,7 @@ impl ServerState {
         let static_dir = options
             .static_dir
             .unwrap_or_else(|| "build".to_string());
+        let accounts = AccountsDb::new(options.persist_dir.as_deref()).await?;
         Ok(Self {
             mac: Hmac::new_from_slice(secret.as_bytes()).unwrap(),
             override_origin: options.override_origin,
@@ -82,7 +88,13 @@ impl ServerState {
             disk,
             oracle_url_file,
             static_dir,
+            accounts,
         })
+    }
+
+    /// Returns the account/invite/board-ownership database.
+    pub fn accounts(&self) -> &AccountsDb {
+        &self.accounts
     }
 
     /// Returns the message authentication code used for signing tokens.

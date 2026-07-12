@@ -34,6 +34,7 @@ rand.workspace = true
 redis = { version = "0.27.6", features = ["tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 serde.workspace = true
 sha2 = "0.10.7"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 sshx-core.workspace = true
 subtle = "2.5.0"
 sysinfo = "0.33.1"

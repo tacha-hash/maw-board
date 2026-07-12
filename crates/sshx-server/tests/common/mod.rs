@@ -40,7 +40,7 @@ impl TestServer {
         let listener = TcpListener::bind("[::1]:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let server = Arc::new(Server::new(options).unwrap());
+        let server = Arc::new(Server::new(options).await.unwrap());
         {
             let server = Arc::clone(&server);
             let listener = listener.tap_io(|tcp_stream| {

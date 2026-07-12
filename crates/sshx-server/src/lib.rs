@@ -66,9 +66,9 @@ pub struct Server {
 
 impl Server {
     /// Create a new application server, but do not listen for connections yet.
-    pub fn new(options: ServerOptions) -> Result<Self> {
+    pub async fn new(options: ServerOptions) -> Result<Self> {
         Ok(Self {
-            state: Arc::new(ServerState::new(options)?),
+            state: Arc::new(ServerState::new(options).await?),
             shutdown: Shutdown::new(),
         })
     }

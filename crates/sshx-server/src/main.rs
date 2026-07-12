@@ -71,7 +71,7 @@ async fn start(args: Args) -> Result<()> {
     options.static_dir = Some(args.static_dir);
     options.persist_dir = args.persist_dir;
 
-    let server = Server::new(options)?;
+    let server = Server::new(options).await?;
 
     let serve_task = async {
         info!("server listening at {addr}");
