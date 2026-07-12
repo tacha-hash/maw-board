@@ -61,7 +61,13 @@ impl AccountsDb {
             Some(dir) => {
                 std::fs::create_dir_all(dir)?;
                 let path = std::path::Path::new(dir).join("accounts.db");
-                SqliteConnectOptions::new().filename(path).create_if_missing(true)
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true)
+                    // The server holds this DB open while the `invite`/
+                    // `migrate-vr5` subcommands open it from a second process;
+                    // wait for the writer lock instead of erroring SQLITE_BUSY.
+                    .busy_timeout(std::time::Duration::from_secs(5))
             }
             None => "sqlite::memory:".parse::<SqliteConnectOptions>()?,
         };
@@ -234,6 +240,22 @@ impl AccountsDb {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Forget a board entirely: drop its membership rows and its ownership row.
+    /// Called when a board is permanently deleted.
+    pub async fn forget_board(&self, name: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM board_members WHERE board_name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM boards WHERE name = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }

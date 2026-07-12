@@ -46,8 +46,15 @@ pub struct ServerOptions {
     /// Hostname of this server, if running multiple servers.
     pub host: Option<String>,
 
-    /// Optional password that gates private board routes.
-    pub board_password: Option<String>,
+    /// Allowed browser Origin for cross-origin-sensitive requests (WS upgrade
+    /// and mutating POST/DELETE). `Some("https://board.off-scrn.com")` in
+    /// production; `None` disables the check for same-origin dev.
+    pub allowed_origin: Option<String>,
+
+    /// Emit session cookies WITHOUT the `Secure` attribute — for plain-HTTP
+    /// localhost dev only, where a `Secure` cookie would never be sent back.
+    /// Never set in production (HTTPS via the reverse proxy).
+    pub insecure_cookies: bool,
 
     /// Path to the file containing the active oracle session URL.
     pub oracle_url_file: Option<String>,

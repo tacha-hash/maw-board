@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Form, Query, State};
@@ -11,18 +10,17 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, get_service};
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-use hmac::{Hmac, Mac as _};
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
 use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use sysinfo::{Components, System};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
+use tracing::error;
 
-use crate::ServerState;
+use crate::state::accounts::JoinOutcome;
+use crate::{auth, ServerState};
 
 pub mod protocol;
 mod pages;
@@ -51,6 +49,7 @@ pub fn app(state: &ServerState) -> Router<Arc<ServerState>> {
 
     Router::new()
         .route("/login", get(login_page).post(login_submit))
+        .route("/join", get(join_page).post(join_submit))
         .route("/go", get(go_redirect))
         .nest("/api", backend())
         .nest_service(
@@ -94,14 +93,18 @@ async fn go_redirect(State(state): State<Arc<ServerState>>) -> Response {
 
 /// Routes for the backend web API server.
 fn backend() -> Router<Arc<ServerState>> {
+    use axum::routing::{delete, post};
     Router::new()
         .route("/s/{name}", any(socket::get_session_ws))
         .route("/sysstat", get(sysstat))
         .route("/files", get(list_files))
         .route("/file", get(read_file))
+        .route("/logout", post(logout))
         .route("/boards", get(list_boards))
-        .route("/boards/new", axum::routing::post(new_board))
-        .route("/boards/{name}", axum::routing::delete(delete_board))
+        .route("/boards/new", post(new_board))
+        .route("/boards/{name}", delete(delete_board))
+        .route("/boards/{name}/members", post(add_member))
+        .route("/boards/{name}/members/{username}", delete(remove_member))
         .route("/healthz", get(healthz))
 }
 
@@ -137,6 +140,7 @@ fn encrypted_zeros_for(key: &str) -> Vec<u8> {
 /// composes the URL from its own origin.
 async fn new_board(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    account: AuthedAccount,
     body: axum::body::Bytes,
 ) -> Response {
     use crate::session::{Metadata, Session};
@@ -157,6 +161,12 @@ async fn new_board(
     };
     let session = Arc::new(Session::new(metadata));
     state.insert(&name, session.clone());
+    // Record ownership so the creator (and only they) can delete it, and so it
+    // shows up in their per-account lobby. Owner is added as a board member.
+    if let Err(err) = state.accounts().create_board(&name, &account.account_id).await {
+        error!(?err, "failed to record board ownership");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to create board").into_response();
+    }
     let jt_for_escrow = crate::grpc::join_token(state.mac(), &name);
     if let Some(disk) = state.disk() {
         if let Ok(snapshot) = session.snapshot() {
@@ -181,22 +191,42 @@ async fn new_board(
     axum::Json(serde_json::json!({ "name": name, "key": key, "join_token": jt })).into_response()
 }
 
-/// Permanently close and forget a board (memory + disk snapshot + key escrow).
-/// No auth beyond network position (tailnet-only), same posture as create/list;
-/// the frontend confirms before calling.
+/// Permanently close and forget a board (memory + disk snapshot + key escrow +
+/// ownership/membership rows). Only the board's owner may delete it.
 async fn delete_board(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    account: AuthedAccount,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    match state.close_session(&name).await {
-        Ok(()) => (StatusCode::OK, "deleted").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    match state.accounts().board_owner(&name).await {
+        Ok(Some(owner)) if owner == account.account_id => {}
+        // Not the owner, or the board has no ownership record (shouldn't exist
+        // post-migration): 404, not 403, so a non-owner can't probe which board
+        // names exist.
+        Ok(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(err) => {
+            error!(?err, "board_owner lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
     }
+    if let Err(e) = state.close_session(&name).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(err) = state.accounts().forget_board(&name).await {
+        error!(?err, "failed to forget board rows");
+        // The session is already gone; report success on the primary action but
+        // log the row-cleanup failure (a stale ownership row is harmless — the
+        // board can't be reopened once its snapshot is deleted).
+    }
+    (StatusCode::OK, "deleted").into_response()
 }
 
-/// Lobby listing: persisted boards (disk) merged with live in-memory sessions.
+/// Lobby listing, scoped to the authenticated account: only boards they own or
+/// are a member of. Membership is a live DB query (never cached in the cookie),
+/// so revoking a share removes the board from the friend's lobby immediately.
 async fn list_boards(
     axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    account: AuthedAccount,
 ) -> Response {
     #[derive(serde::Serialize)]
     struct BoardInfo {
@@ -205,12 +235,26 @@ async fn list_boards(
         modified: Option<u64>,
         size: Option<u64>,
     }
+    let allowed: std::collections::HashSet<String> = match state
+        .accounts()
+        .boards_for_account(&account.account_id)
+        .await
+    {
+        Ok(names) => names.into_iter().collect(),
+        Err(err) => {
+            error!(?err, "boards_for_account failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response();
+        }
+    };
     let live: std::collections::HashSet<String> =
         state.live_session_names().into_iter().collect();
     let mut out: Vec<BoardInfo> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if let Some(disk) = state.disk() {
         for b in disk.list() {
+            if !allowed.contains(&b.name) {
+                continue;
+            }
             seen.insert(b.name.clone());
             out.push(BoardInfo {
                 live: live.contains(&b.name),
@@ -221,11 +265,61 @@ async fn list_boards(
         }
     }
     for name in live {
-        if !seen.contains(&name) {
+        if allowed.contains(&name) && !seen.contains(&name) {
             out.push(BoardInfo { name, live: true, modified: None, size: None });
         }
     }
     axum::Json(out).into_response()
+}
+
+/// Body for adding a member to a board by username.
+#[derive(Deserialize)]
+struct AddMemberBody {
+    username: String,
+}
+
+/// Share a board with another account by username (owner only).
+async fn add_member(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<AddMemberBody>,
+) -> Response {
+    if !require_board_owner(&state, &name, &account.account_id).await {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match state.accounts().add_member_by_username(&name, &body.username).await {
+        Ok(true) => (StatusCode::OK, "added").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such user").into_response(),
+        Err(err) => {
+            error!(?err, "add_member failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+        }
+    }
+}
+
+/// Remove a member from a board by username (owner only).
+async fn remove_member(
+    axum::extract::State(state): axum::extract::State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::extract::Path((name, username)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !require_board_owner(&state, &name, &account.account_id).await {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match state.accounts().remove_member_by_username(&name, &username).await {
+        Ok(_) => (StatusCode::OK, "removed").into_response(),
+        Err(err) => {
+            error!(?err, "remove_member failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+        }
+    }
+}
+
+/// True only if `account_id` owns board `name`. Used to gate owner-only board
+/// administration (delete, membership changes).
+async fn require_board_owner(state: &ServerState, name: &str, account_id: &str) -> bool {
+    matches!(state.accounts().board_owner(name).await, Ok(Some(owner)) if owner == account_id)
 }
 
 async fn healthz(req: Request<Body>) -> Response {
@@ -251,120 +345,193 @@ async fn healthz(req: Request<Body>) -> Response {
     }
 }
 
-const BOARD_AUTH_COOKIE: &str = "sshx_board_auth";
-const BOARD_AUTH_TTL_SECS: u64 = 60 * 60 * 24 * 30;
-type HmacSha256 = Hmac<Sha256>;
+/// How long a browser session cookie stays valid.
+const SESSION_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 
-#[derive(Deserialize)]
-struct LoginParams {
-    next: Option<String>,
+/// An authenticated account, extracted from the session claims the
+/// [`session_auth_gate`] injected into the request. Handlers that need to know
+/// *who* is calling take this; the gate guarantees it's present for every
+/// non-public route, so the rejection here is only a defensive fallback.
+pub struct AuthedAccount {
+    /// The authenticated account's id.
+    pub account_id: String,
 }
 
-#[derive(Deserialize)]
-struct LoginForm {
-    password: String,
-    next: Option<String>,
+impl FromRequestParts<Arc<ServerState>> for AuthedAccount {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<auth::SessionClaims>()
+            .map(|c| AuthedAccount {
+                account_id: c.account_id.clone(),
+            })
+            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "login required").into_response())
+    }
 }
 
-/// Password middleware for private board routes.
-///
-/// When `SSHX_BOARD_PASSWORD` is unset, the gate is disabled. When it is set,
-/// `/go`, direct `/s/*` session pages, the session WebSocket, and the file APIs
-/// require a signed auth cookie minted by the local login form.
-pub(crate) async fn board_password_gate(
+/// Authentication + board-access middleware (replaces the old shared-password
+/// gate). Every route except the public allow-list requires a valid session;
+/// board-scoped routes additionally require live membership. Identity is proven
+/// by the session cookie (a Bearer connector-token path is added with the
+/// connector-auth unit); *authorization* to a board is always a fresh DB query,
+/// never trusted from the cookie (Le MUST-2).
+pub(crate) async fn session_auth_gate(
     State(state): State<Arc<ServerState>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(password) = state.board_password() else {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    // Auth pages/APIs and the hashed static bundle are reachable without a
+    // session — everything else is gated.
+    if is_public_path(&path) {
         return next.run(req).await;
-    };
-    let uri = req.uri().clone();
-    let path = uri.path();
-    if !requires_board_password(path) || has_valid_board_cookie(req.headers(), password) {
-        return next.run(req).await;
     }
 
-    if should_redirect_to_login(req.method(), path) {
-        login_redirect(&uri)
-    } else {
-        (StatusCode::UNAUTHORIZED, "board password required").into_response()
+    // Reject cross-origin-sensitive requests from a disallowed Origin (defense
+    // in depth alongside the SameSite=Lax cookie).
+    if origin_denied(&state, &method, &path, req.headers()) {
+        return (StatusCode::FORBIDDEN, "bad origin").into_response();
     }
+
+    // Authentication: who is this?
+    let Some(claims) = session_from_headers(&state, req.headers()) else {
+        return unauthenticated_response(&method, req.uri());
+    };
+    // The account must still exist (deleting an account revokes its sessions).
+    if !matches!(
+        state.accounts().account_exists(&claims.account_id).await,
+        Ok(true)
+    ) {
+        return unauthenticated_response(&method, req.uri());
+    }
+
+    // Authorization for board-scoped routes: a live membership check, so
+    // removing a share revokes access immediately.
+    if let Some(board) = board_scope(&path) {
+        if !matches!(
+            state.accounts().is_member(board, &claims.account_id).await,
+            Ok(true)
+        ) {
+            return board_forbidden_response(&method, &path);
+        }
+    }
+
+    req.extensions_mut().insert(claims);
+    next.run(req).await
 }
 
-async fn login_page(
-    State(state): State<Arc<ServerState>>,
-    Query(params): Query<LoginParams>,
-    headers: HeaderMap,
-) -> Response {
-    let next = sanitize_next(params.next.as_deref());
-    let Some(password) = state.board_password() else {
-        return redirect_response(&next, None);
-    };
-    if has_valid_board_cookie(&headers, password) {
-        return redirect_response(&next, None);
-    }
-    login_form_response(&next, false)
-}
-
-async fn login_submit(
-    State(state): State<Arc<ServerState>>,
-    Form(form): Form<LoginForm>,
-) -> Response {
-    let next = sanitize_next(form.next.as_deref());
-    let Some(password) = state.board_password() else {
-        return redirect_response(&next, None);
-    };
-    if !password_matches(&form.password, password) {
-        return login_form_response(&next, true);
-    }
-
-    let cookie = make_board_auth_cookie(password);
-    redirect_response(&next, Some(&cookie))
-}
-
-fn requires_board_password(path: &str) -> bool {
-    path == "/go"
-        || path == "/s"
-        || path.starts_with("/s/")
-        || path == "/api/files"
-        || path == "/api/file"
-        || path == "/api/s"
+/// Paths reachable without a session: the auth pages/endpoints, logout (a no-op
+/// when already logged out), the health probe, the content-hashed app bundle
+/// (no data, needed to render the app once logged in), and the board
+/// WebSocket.
+///
+/// The WebSocket (`/api/s/{name}`) is intentionally passed through here in F0
+/// chunk 2: it keeps its existing end-to-end encryption-key challenge (a
+/// non-member can't obtain the board key — the key is handed out member-only by
+/// the /key endpoint), and its session + live-membership + per-shell
+/// authorization lands with per-shell ownership enforcement (task 4), where the
+/// WS layer gains account awareness. Gating it here would only break the
+/// existing WS tests without adding a boundary the key challenge doesn't
+/// already provide.
+fn is_public_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/login"
+            | "/join"
+            | "/api/logout"
+            | "/api/healthz"
+            | "/api/s"
+            | "/favicon.ico"
+            | "/favicon.png"
+            | "/robots.txt"
+            | "/manifest.json"
+    ) || path.starts_with("/_app/")
         || path.starts_with("/api/s/")
 }
 
-fn should_redirect_to_login(method: &Method, path: &str) -> bool {
-    method == Method::GET && (path == "/go" || path == "/s" || path.starts_with("/s/"))
+/// The board name the board *page* (`/s/{name}`) is scoped to, for the gate's
+/// membership check. The WebSocket (`/api/s/{name}`) is handled at the WS layer
+/// (task 4), not here.
+fn board_scope(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/s/")?;
+    let name = rest.split('/').next().unwrap_or(rest);
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether to reject a request on Origin grounds. Only checks cross-origin
+/// sensitive requests (mutating verbs and the board WS upgrade), only when an
+/// allow-list is configured, and only rejects a *present, mismatched* Origin —
+/// an absent Origin (CLI tools, the connector) is allowed, since SameSite=Lax
+/// already blocks the browser CSRF cases.
+fn origin_denied(state: &ServerState, method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    let Some(allowed) = state.allowed_origin() else {
+        return false;
+    };
+    let sensitive = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        || path.starts_with("/api/s/");
+    if !sensitive {
+        return false;
+    }
+    match headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        Some(origin) => origin != allowed,
+        None => false,
+    }
+}
+
+/// Resolve the session claims from a request's cookies, if a valid unexpired
+/// cookie is present.
+fn session_from_headers(state: &ServerState, headers: &HeaderMap) -> Option<auth::SessionClaims> {
+    let cookie = cookie_value(headers, auth::SESSION_COOKIE)?;
+    auth::verify_session_cookie(state.mac(), cookie)
+}
+
+/// Response for an unauthenticated request: redirect browser GET navigation to
+/// the login page (preserving where they were headed), 401 for API/non-GET.
+fn unauthenticated_response(method: &Method, uri: &Uri) -> Response {
+    if method == Method::GET && !uri.path().starts_with("/api/") {
+        login_redirect(uri)
+    } else {
+        (StatusCode::UNAUTHORIZED, "login required").into_response()
+    }
+}
+
+/// Response for an authenticated-but-not-a-member request: send browser board
+/// navigation back to the lobby, 403 for the WebSocket/API.
+fn board_forbidden_response(method: &Method, path: &str) -> Response {
+    if method == Method::GET && path.starts_with("/s/") {
+        redirect_response("/", None)
+    } else {
+        (StatusCode::FORBIDDEN, "not a member of this board").into_response()
+    }
 }
 
 fn login_redirect(uri: &Uri) -> Response {
-    let next = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/go");
+    let next = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let location = format!("/login?next={}", percent_encode_query(next));
     redirect_response(&location, None)
 }
 
-fn redirect_response(location: &str, cookie: Option<&str>) -> Response {
+/// A 303 redirect, optionally carrying a full `Set-Cookie` header value.
+fn redirect_response(location: &str, set_cookie: Option<&str>) -> Response {
     let mut response = StatusCode::SEE_OTHER.into_response();
-    let location = header_value(location).unwrap_or_else(|| HeaderValue::from_static("/go"));
+    let location = header_value(location).unwrap_or_else(|| HeaderValue::from_static("/login"));
     response.headers_mut().insert(header::LOCATION, location);
-    if let Some(cookie) = cookie {
-        let set_cookie = format!(
-            "{BOARD_AUTH_COOKIE}={cookie}; Max-Age={BOARD_AUTH_TTL_SECS}; Path=/; HttpOnly; Secure; SameSite=Lax"
-        );
-        if let Some(value) = header_value(&set_cookie) {
+    if let Some(sc) = set_cookie {
+        if let Some(value) = header_value(sc) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
     }
     response
 }
 
-fn login_form_response(next: &str, failed: bool) -> Response {
-    let html = pages::login_form_page(next, failed);
-    let status = if failed {
-        StatusCode::UNAUTHORIZED
-    } else {
-        StatusCode::OK
-    };
+fn html_page(html: String, status: StatusCode) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -373,55 +540,169 @@ fn login_form_response(next: &str, failed: bool) -> Response {
         .into_response()
 }
 
-fn make_board_auth_cookie(password: &str) -> String {
-    let expires = now_unix_secs().saturating_add(BOARD_AUTH_TTL_SECS);
-    let payload = format!("v1:{expires}");
-    let sig = sign_board_auth(password, &payload);
-    format!("{payload}:{}", URL_SAFE_NO_PAD.encode(sig))
+#[derive(Deserialize)]
+struct LoginParams {
+    next: Option<String>,
 }
 
-fn has_valid_board_cookie(headers: &HeaderMap, password: &str) -> bool {
-    let Some(cookie) = cookie_value(headers, BOARD_AUTH_COOKIE) else {
-        return false;
-    };
-    verify_board_auth_cookie(cookie, password)
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+    next: Option<String>,
 }
 
-fn verify_board_auth_cookie(cookie: &str, password: &str) -> bool {
-    let mut parts = cookie.split(':');
-    let (Some(version), Some(expires), Some(sig), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    if version != "v1" {
-        return false;
+async fn login_page(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<LoginParams>,
+    headers: HeaderMap,
+) -> Response {
+    let next = sanitize_next(params.next.as_deref());
+    if session_from_headers(&state, &headers).is_some() {
+        return redirect_response(&next, None);
     }
-    let Ok(expires_at) = expires.parse::<u64>() else {
-        return false;
+    html_page(pages::login_form_page(&next, false), StatusCode::OK)
+}
+
+async fn login_submit(
+    State(state): State<Arc<ServerState>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let next = sanitize_next(form.next.as_deref());
+    let account = state
+        .accounts()
+        .account_by_username(&form.username)
+        .await
+        .ok()
+        .flatten();
+    let verified = match account.as_ref().and_then(|a| a.password_hash.as_deref()) {
+        Some(hash) => auth::verify_account_password(&form.password, hash),
+        None => {
+            // Verify against a throwaway hash even when the username doesn't
+            // exist (or is passkey-only), so response time doesn't reveal which
+            // usernames are registered.
+            let _ = auth::verify_account_password(&form.password, dummy_pw_hash());
+            false
+        }
     };
-    if expires_at < now_unix_secs() {
-        return false;
+    if !verified {
+        return html_page(pages::login_form_page(&next, true), StatusCode::UNAUTHORIZED);
     }
-    let Ok(provided) = URL_SAFE_NO_PAD.decode(sig) else {
-        return false;
+    let account = account.expect("verified implies the account was found");
+    let value = auth::mint_session_cookie(state.mac(), &account.id, SESSION_TTL_SECS);
+    let set_cookie = auth::session_set_cookie(&value, SESSION_TTL_SECS, !state.insecure_cookies());
+    redirect_response(&next, Some(&set_cookie))
+}
+
+async fn logout(State(state): State<Arc<ServerState>>) -> Response {
+    let clear = auth::session_clear_cookie(!state.insecure_cookies());
+    let mut response = (StatusCode::OK, "logged out").into_response();
+    if let Some(value) = header_value(&clear) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+#[derive(Deserialize)]
+struct JoinParams {
+    code: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JoinForm {
+    code: String,
+    username: String,
+    password: String,
+}
+
+async fn join_page(
+    State(state): State<Arc<ServerState>>,
+    Query(params): Query<JoinParams>,
+    headers: HeaderMap,
+) -> Response {
+    if session_from_headers(&state, &headers).is_some() {
+        return redirect_response("/", None);
+    }
+    let code = params.code.unwrap_or_default();
+    html_page(pages::join_form_page(&code, None), StatusCode::OK)
+}
+
+async fn join_submit(
+    State(state): State<Arc<ServerState>>,
+    Form(form): Form<JoinForm>,
+) -> Response {
+    if !valid_username(&form.username) {
+        return html_page(
+            pages::join_form_page(
+                &form.code,
+                Some("Username must be 3–32 characters: letters, digits, - or _."),
+            ),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    if form.password.chars().count() < 8 {
+        return html_page(
+            pages::join_form_page(&form.code, Some("Password must be at least 8 characters.")),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let hash = match auth::hash_account_password(&form.password) {
+        Ok(h) => h,
+        Err(err) => {
+            error!(?err, "password hashing failed");
+            return html_page(
+                pages::join_form_page(&form.code, Some("Something went wrong. Please try again.")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
     };
-    let payload = format!("v1:{expires_at}");
-    let expected = sign_board_auth(password, &payload);
-    provided.as_slice().ct_eq(expected.as_slice()).into()
+    match state
+        .accounts()
+        .redeem_invite(&form.code, &form.username, &hash)
+        .await
+    {
+        Ok(JoinOutcome::Created(account)) => {
+            // Auto-login on successful join, straight to the lobby.
+            let value = auth::mint_session_cookie(state.mac(), &account.id, SESSION_TTL_SECS);
+            let set_cookie =
+                auth::session_set_cookie(&value, SESSION_TTL_SECS, !state.insecure_cookies());
+            redirect_response("/", Some(&set_cookie))
+        }
+        Ok(JoinOutcome::InvalidInvite) => html_page(
+            pages::join_form_page(&form.code, Some("This invite is invalid or already used.")),
+            StatusCode::BAD_REQUEST,
+        ),
+        Ok(JoinOutcome::UsernameTaken) => html_page(
+            pages::join_form_page(&form.code, Some("That username is already taken.")),
+            StatusCode::CONFLICT,
+        ),
+        Err(err) => {
+            error!(?err, "invite redemption failed");
+            html_page(
+                pages::join_form_page(&form.code, Some("Something went wrong. Please try again.")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    }
 }
 
-fn sign_board_auth(password: &str, payload: &str) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(password.as_bytes()).unwrap();
-    mac.update(b"sshx-board-auth-cookie\0");
-    mac.update(payload.as_bytes());
-    mac.finalize().into_bytes().to_vec()
+/// A username is 3–32 chars of `[A-Za-z0-9_-]`. Kept deliberately narrow so
+/// usernames are safe to interpolate into HTML/paths and can't collide with the
+/// cookie's `:` delimiter.
+fn valid_username(u: &str) -> bool {
+    let len = u.chars().count();
+    (3..=32).contains(&len)
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn password_matches(submitted: &str, expected: &str) -> bool {
-    let submitted_hash = Sha256::digest(submitted.as_bytes());
-    let expected_hash = Sha256::digest(expected.as_bytes());
-    submitted_hash.ct_eq(&expected_hash).into()
+/// A stable throwaway argon2 hash for timing-equalization on failed logins,
+/// computed once.
+fn dummy_pw_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        auth::hash_account_password("timing-equalizer-not-a-real-password").unwrap_or_default()
+    })
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -443,7 +724,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn sanitize_next(value: Option<&str>) -> String {
     let Some(value) = value else {
-        return "/go".to_string();
+        return "/".to_string();
     };
     if value.starts_with('/')
         && !value.starts_with("//")
@@ -452,7 +733,7 @@ fn sanitize_next(value: Option<&str>) -> String {
     {
         value.to_string()
     } else {
-        "/go".to_string()
+        "/".to_string()
     }
 }
 
@@ -485,13 +766,6 @@ pub(crate) fn escape_html_attr(value: &str) -> String {
 
 fn header_value(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(value).ok()
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Default file browser root (VPS deployments). Overridable at runtime via the

@@ -14,18 +14,6 @@ use crate::common::*;
 
 pub mod common;
 
-fn auth_cookie_from_response(resp: &reqwest::Response) -> String {
-    resp.headers()
-        .get(http::header::SET_COOKIE)
-        .expect("login should set auth cookie")
-        .to_str()
-        .expect("set-cookie should be ASCII")
-        .split(';')
-        .next()
-        .expect("set-cookie should contain a cookie pair")
-        .to_string()
-}
-
 #[tokio::test]
 async fn test_handshake() -> Result<()> {
     let server = TestServer::new().await;
@@ -302,10 +290,57 @@ async fn test_read_write_permissions() -> Result<()> {
     Ok(())
 }
 
+/// The file browser is now behind the session gate: an unauthenticated request
+/// is rejected before it reaches the handler.
+#[tokio::test]
+async fn test_file_api_requires_auth() -> Result<()> {
+    let server = TestServer::new().await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    for path in ["/api/files?path=", "/api/file?path=x.txt"] {
+        let resp = client.get(format!("{base}{path}")).send().await?;
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED, "{path}");
+    }
+    Ok(())
+}
+
+// Exercises the file-browser handlers (listing, traversal/symlink guards, size
+// limits) as an authenticated user. Ignored by default because it reads and
+// writes under /root/maw-workspace, which only exists on the server host; run
+// with `cargo test -- --ignored` there.
+#[ignore = "requires /root/maw-workspace (server host only)"]
 #[tokio::test]
 async fn test_files_api() -> Result<()> {
-    let server = TestServer::new().await;
-    let client = reqwest::Client::new();
+    // The file-browser API is now behind the session gate, so authenticate
+    // first: create an account, log in (cookie stored by the client), then
+    // every subsequent request carries the session automatically.
+    let mut options = ServerOptions::default();
+    options.insecure_cookies = true; // plain-HTTP test → cookie must omit Secure
+    let server = TestServer::new_with_options(options).await;
+    let hash = sshx_server::auth::hash_account_password("test-password-123").unwrap();
+    server
+        .state()
+        .accounts()
+        .bootstrap_account("tester", &hash)
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let base = format!("http://{}", server.local_addr());
+    let login = client
+        .post(format!("{base}/login"))
+        .form(&[("username", "tester"), ("password", "test-password-123")])
+        .send()
+        .await?;
+    assert_eq!(login.status(), http::StatusCode::SEE_OTHER);
+    // A cookie-less client is rejected by the gate, proving the endpoint is
+    // protected now.
+    let anon = reqwest::Client::new();
+    let anon_resp = anon.get(format!("{base}/api/files?path=")).send().await?;
+    assert_eq!(anon_resp.status(), http::StatusCode::UNAUTHORIZED);
+
     let test_prefix = format!("sshx_test_{}", server.local_addr().port());
 
     // 1. Test listing files
@@ -451,109 +486,12 @@ async fn test_files_api() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_board_password_gate() -> Result<()> {
-    let mut options = ServerOptions::default();
-    options.board_password = Some("test board password".to_string());
-    let server = TestServer::new_with_options(options).await;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let base = format!("http://{}", server.local_addr());
-
-    // Browser-facing board routes redirect to the local login page.
-    let resp = client.get(format!("{base}/go")).send().await?;
-    assert_eq!(resp.status(), http::StatusCode::SEE_OTHER);
-    assert_eq!(
-        resp.headers().get(http::header::LOCATION).unwrap(),
-        "/login?next=%2Fgo"
-    );
-
-    let resp = client.get(format!("{base}/s/demo")).send().await?;
-    assert_eq!(resp.status(), http::StatusCode::SEE_OTHER);
-    assert_eq!(
-        resp.headers().get(http::header::LOCATION).unwrap(),
-        "/login?next=%2Fs%2Fdemo"
-    );
-
-    // API and WebSocket paths fail closed instead of redirecting an XHR/WS.
-    let resp = client.get(format!("{base}/api/files?path=")).send().await?;
-    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
-
-    let resp = client
-        .get(format!("{base}/api/files?path="))
-        .header(
-            http::header::COOKIE,
-            "sshx_board_auth=v1:9999999999:tampered",
-        )
-        .send()
-        .await?;
-    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
-
-    let resp = client.get(format!("{base}/api/s/demo")).send().await?;
-    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
-
-    // Wrong passwords do not mint a cookie.
-    let resp = client
-        .post(format!("{base}/login"))
-        .form(&[("password", "wrong"), ("next", "/go")])
-        .send()
-        .await?;
-    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
-    assert!(resp.headers().get(http::header::SET_COOKIE).is_none());
-
-    // Correct passwords mint a signed, long-lived, browser-safe auth cookie.
-    let resp = client
-        .post(format!("{base}/login"))
-        .form(&[("password", "test board password"), ("next", "/s/demo#key")])
-        .send()
-        .await?;
-    assert_eq!(resp.status(), http::StatusCode::SEE_OTHER);
-    assert_eq!(
-        resp.headers().get(http::header::LOCATION).unwrap(),
-        "/s/demo#key"
-    );
-    let set_cookie = resp
-        .headers()
-        .get(http::header::SET_COOKIE)
-        .unwrap()
-        .to_str()?;
-    assert!(set_cookie.starts_with("sshx_board_auth=v1:"));
-    assert!(set_cookie.contains("Max-Age=2592000"));
-    assert!(set_cookie.contains("HttpOnly"));
-    assert!(set_cookie.contains("Secure"));
-    assert!(set_cookie.contains("SameSite=Lax"));
-    let cookie = auth_cookie_from_response(&resp);
-
-    let resp = client
-        .get(format!("{base}/api/files?path="))
-        .header(http::header::COOKIE, &cookie)
-        .send()
-        .await?;
-    assert_eq!(resp.status(), http::StatusCode::OK);
-
-    let file_name = format!("sshx_auth_test_{}.txt", server.local_addr().port());
-    let file_path = std::path::PathBuf::from(format!("/root/maw-workspace/{file_name}"));
-    tokio::fs::write(&file_path, b"authed file").await?;
-    let resp = client
-        .get(format!("{base}/api/file?path={file_name}"))
-        .header(http::header::COOKIE, &cookie)
-        .send()
-        .await?;
-    assert_eq!(resp.status(), http::StatusCode::OK);
-    assert!(resp.text().await?.contains("\"content\":\"authed file\""));
-    tokio::fs::remove_file(&file_path).await.ok();
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_healthz() -> Result<()> {
-    let mut options = ServerOptions::default();
-    options.board_password = Some("test board password".to_string());
-    let server = TestServer::new_with_options(options).await;
+    let server = TestServer::new().await;
     let client = reqwest::Client::new();
     let base = format!("http://{}", server.local_addr());
 
+    // /api/healthz is a public path — reachable without a session.
     let resp = client.get(format!("{base}/api/healthz")).send().await?;
     assert_eq!(resp.status(), http::StatusCode::OK);
     assert_eq!(resp.text().await?, "OK");

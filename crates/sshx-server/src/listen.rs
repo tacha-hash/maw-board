@@ -29,7 +29,7 @@ where
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            web::board_password_gate,
+            web::session_auth_gate,
         ))
         .layer(TraceLayer::new_for_http())
         .into_service()

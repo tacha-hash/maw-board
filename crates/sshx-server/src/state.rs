@@ -38,8 +38,11 @@ pub struct ServerState {
     /// Override the origin returned for the Open() RPC.
     override_origin: Option<String>,
 
-    /// Password that gates private board routes, if configured.
-    board_password: Option<String>,
+    /// Allowed browser Origin for cross-origin-sensitive requests, if set.
+    allowed_origin: Option<String>,
+
+    /// Whether to emit session cookies without the `Secure` attribute (dev).
+    insecure_cookies: bool,
 
     /// A concurrent map of session IDs to session objects.
     store: DashMap<String, Arc<Session>>,
@@ -82,7 +85,8 @@ impl ServerState {
         Ok(Self {
             mac: Hmac::new_from_slice(secret.as_bytes()).unwrap(),
             override_origin: options.override_origin,
-            board_password: options.board_password.filter(|p| !p.is_empty()),
+            allowed_origin: options.allowed_origin.filter(|o| !o.is_empty()),
+            insecure_cookies: options.insecure_cookies,
             store: DashMap::new(),
             mesh,
             disk,
@@ -107,9 +111,15 @@ impl ServerState {
         self.override_origin.clone()
     }
 
-    /// Returns the configured private board password, if enabled.
-    pub fn board_password(&self) -> Option<&str> {
-        self.board_password.as_deref()
+    /// Returns the allowed browser Origin for cross-origin-sensitive requests,
+    /// if an allow-list is configured.
+    pub fn allowed_origin(&self) -> Option<&str> {
+        self.allowed_origin.as_deref()
+    }
+
+    /// Whether session cookies should be emitted without `Secure` (dev only).
+    pub fn insecure_cookies(&self) -> bool {
+        self.insecure_cookies
     }
 
     /// Returns the path to the oracle URL file.
