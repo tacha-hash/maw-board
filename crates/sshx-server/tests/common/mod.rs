@@ -132,10 +132,27 @@ impl ClientSocket {
         write_password: Option<&str>,
         cookie: Option<&str>,
     ) -> Result<Self> {
+        let auth = cookie.map(|c| ("cookie", c.to_string()));
+        Self::connect_with_auth(uri, key, write_password, auth).await
+    }
+
+    /// Connect authenticating with an `Authorization: Bearer <token>` header —
+    /// how the connector (not a browser) opens the board WS.
+    pub async fn connect_bearer(uri: &str, key: &str, token: &str) -> Result<Self> {
+        Self::connect_with_auth(uri, key, None, Some(("authorization", format!("Bearer {token}"))))
+            .await
+    }
+
+    async fn connect_with_auth(
+        uri: &str,
+        key: &str,
+        write_password: Option<&str>,
+        auth: Option<(&'static str, String)>,
+    ) -> Result<Self> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = uri.into_client_request()?;
-        if let Some(cookie) = cookie {
-            request.headers_mut().insert("cookie", cookie.parse()?);
+        if let Some((header, value)) = auth {
+            request.headers_mut().insert(header, value.parse()?);
         }
         let (stream, resp) = tokio_tungstenite::connect_async(request).await?;
         ensure!(resp.status() == StatusCode::SWITCHING_PROTOCOLS);

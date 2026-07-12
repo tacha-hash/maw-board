@@ -427,6 +427,45 @@ async fn test_cross_account_shell_write_rejected() -> Result<()> {
     Ok(())
 }
 
+/// The connector opens its OWN board WebSocket (to post roster/chat/order items)
+/// and authenticates with a Bearer connector-token, not a browser cookie. The
+/// connect gate must admit it as a member — the dual-auth the REST endpoints
+/// already use. (Integration round 2 caught this gap; this locks it.)
+#[tokio::test]
+async fn test_connector_bearer_ws_connect() -> Result<()> {
+    let server = TestServer::new().await;
+    let state = server.state();
+
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let name = controller.name().to_owned();
+    let key = controller.encryption_key().to_owned();
+    tokio::spawn(async move { controller.run().await });
+
+    // A connector account that is a member of this board, with a token.
+    let hash = sshx_server::auth::hash_account_password("pw").unwrap();
+    let conn = state.accounts().bootstrap_account("conn", &hash).await?;
+    state.accounts().create_board(&name, &conn.id).await?; // conn becomes a member
+    let token = "conn-token-xyz";
+    state
+        .accounts()
+        .set_connector_token("conn", &sshx_server::auth::connector_token_hash(token))
+        .await?;
+
+    // Bearer connector-token (no cookie) → admitted.
+    let mut s = ClientSocket::connect_bearer(&server.ws_endpoint(&name), &key, token).await?;
+    s.flush().await;
+    assert_eq!(s.user_id, Uid(1), "connector WS should authenticate and join");
+
+    // A bogus bearer token → rejected at the connect gate.
+    assert!(
+        ClientSocket::connect_bearer(&server.ws_endpoint(&name), &key, "wrong-token")
+            .await
+            .is_err()
+    );
+
+    Ok(())
+}
+
 /// The file browser is now behind the session gate: an unauthenticated request
 /// is rejected before it reaches the handler.
 #[tokio::test]

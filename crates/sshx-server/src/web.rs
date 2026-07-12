@@ -587,26 +587,28 @@ fn session_from_headers(state: &ServerState, headers: &HeaderMap) -> Option<auth
 }
 
 /// The board WebSocket connect gate (VR5 exposure-gate item 1): the caller must
-/// present a valid session cookie for an existing account that is a live member
-/// of `board`. Returns the account id to enforce per-shell ownership on, or an
-/// error response to fail the upgrade with. Connectors don't open the browser
-/// WS (they Join via gRPC), so cookie-only is correct here.
+/// authenticate as a live member of `board`. Authentication is dual, exactly
+/// like `/api/boards` and `/key` — a browser presents a session cookie; the
+/// connector (whose own WS posts roster/chat/order items) presents an
+/// `Authorization: Bearer <connector-token>`. Returns the account id (for
+/// per-shell ownership), or an error response to fail the upgrade with.
+///
+/// Per-shell ownership is a separate, later layer: the connector authenticates
+/// here as a member (it's the board owner) and is admitted, but that doesn't let
+/// it type into anyone's terminal — its board-item posts aren't shell mutations,
+/// and `may_mutate_shell` still gates Data/Move/Close by shell owner regardless.
 pub(crate) async fn ws_connect_gate(
     state: &ServerState,
     headers: &HeaderMap,
     board: &str,
 ) -> Result<String, Response> {
-    let Some(claims) = session_from_headers(state, headers) else {
+    // resolve_identity already validates the cookie (and account existence) or
+    // the bearer connector-token.
+    let Some(identity) = resolve_identity(state, headers).await else {
         return Err((StatusCode::UNAUTHORIZED, "login required").into_response());
     };
-    if !matches!(
-        state.accounts().account_exists(&claims.account_id).await,
-        Ok(true)
-    ) {
-        return Err((StatusCode::UNAUTHORIZED, "login required").into_response());
-    }
-    match state.accounts().is_member(board, &claims.account_id).await {
-        Ok(true) => Ok(claims.account_id),
+    match state.accounts().is_member(board, &identity.account_id).await {
+        Ok(true) => Ok(identity.account_id),
         _ => Err((StatusCode::FORBIDDEN, "not a member of this board").into_response()),
     }
 }
