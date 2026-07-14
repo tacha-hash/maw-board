@@ -79,6 +79,44 @@ struct ConnectorRegistry {
     next_id: u64,
 }
 
+/// One in-flight device pairing (VR5 F1d — OAuth device-flow style, so the
+/// native app never makes the user copy a token). Keyed by `device_code` (a
+/// secret only the app holds). Short-lived and in-memory: a server restart
+/// during the ~10-minute window just makes the user re-pair.
+struct Pairing {
+    /// Short human code shown in the app and confirmed in the browser.
+    user_code: String,
+    /// Friendly device label the user sees when approving.
+    device_name: String,
+    /// The approving account, once approved.
+    account_id: Option<String>,
+    /// The freshly-minted connector token, handed to the app on poll after
+    /// approval (raw, never persisted — the app writes it to its own config).
+    token: Option<String>,
+    /// Unix-seconds expiry; polls/approvals past this are rejected.
+    expires_at: u64,
+}
+
+/// Result of the app polling a pairing with its `device_code`.
+pub enum PairPoll {
+    /// Waiting for the user to approve in the browser.
+    Pending,
+    /// Approved — hand the app its connector token (once).
+    Approved { token: String },
+    /// Unknown device_code, or the pairing expired.
+    Expired,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long a pairing stays valid before the user must restart it.
+const PAIRING_TTL_SECS: u64 = 600;
+
 /// Shared state object for global server logic.
 pub struct ServerState {
     /// Message authentication code for signing tokens.
@@ -115,6 +153,9 @@ pub struct ServerState {
     /// account id; the value holds every live connector that account has open.
     /// Used to push serve/unserve events and to report connector-online status.
     connectors: DashMap<String, ConnectorRegistry>,
+
+    /// In-flight device pairings (Vision Round 5 F1d), keyed by `device_code`.
+    pairings: DashMap<String, Pairing>,
 }
 
 impl ServerState {
@@ -148,6 +189,7 @@ impl ServerState {
             static_dir,
             accounts,
             connectors: DashMap::new(),
+            pairings: DashMap::new(),
         })
     }
 
@@ -191,6 +233,73 @@ impl ServerState {
     pub fn connector_push(&self, account_id: &str, event: ConnectorEvent) {
         if let Some(mut entry) = self.connectors.get_mut(account_id) {
             entry.handles.retain(|h| h.tx.send(event.clone()).is_ok());
+        }
+    }
+
+    /// Begin a device pairing (VR5 F1d). Returns `(device_code, user_code)` —
+    /// the app keeps `device_code` secret and shows `user_code` for the user to
+    /// confirm in the browser. Also opportunistically drops expired pairings.
+    pub fn pair_start(&self, device_name: &str) -> (String, String) {
+        let now = now_secs();
+        self.pairings.retain(|_, p| p.expires_at > now);
+        let device_code = rand_alphanumeric(32);
+        // Human code: short + uppercased so it's easy to read back.
+        let user_code = rand_alphanumeric(8).to_uppercase();
+        self.pairings.insert(
+            device_code.clone(),
+            Pairing {
+                user_code: user_code.clone(),
+                device_name: device_name.chars().take(64).collect(),
+                account_id: None,
+                token: None,
+                expires_at: now + PAIRING_TTL_SECS,
+            },
+        );
+        (device_code, user_code)
+    }
+
+    /// Look up the device label for a `user_code` (for the /pair confirm page).
+    /// `None` if no live pairing matches.
+    pub fn pair_device_name(&self, user_code: &str) -> Option<String> {
+        let now = now_secs();
+        self.pairings
+            .iter()
+            .find(|p| p.user_code == user_code && p.expires_at > now)
+            .map(|p| p.device_name.clone())
+    }
+
+    /// Approve the pairing for `user_code` on behalf of `account_id`, storing the
+    /// freshly-minted connector `token` for the app to collect on its next poll.
+    /// Returns false if no live pairing matches.
+    pub fn pair_approve(&self, user_code: &str, account_id: &str, token: &str) -> bool {
+        let now = now_secs();
+        for mut p in self.pairings.iter_mut() {
+            if p.user_code == user_code && p.expires_at > now {
+                p.account_id = Some(account_id.to_string());
+                p.token = Some(token.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Poll a pairing by `device_code` (the app's secret). Once approved, the
+    /// token is returned exactly once and the pairing is consumed.
+    pub fn pair_poll(&self, device_code: &str) -> PairPoll {
+        let now = now_secs();
+        match self.pairings.get(device_code).map(|p| {
+            (p.expires_at > now, p.token.clone())
+        }) {
+            None => PairPoll::Expired,
+            Some((false, _)) => {
+                self.pairings.remove(device_code);
+                PairPoll::Expired
+            }
+            Some((true, Some(token))) => {
+                self.pairings.remove(device_code); // one-shot
+                PairPoll::Approved { token }
+            }
+            Some((true, None)) => PairPoll::Pending,
         }
     }
 

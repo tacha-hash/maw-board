@@ -104,6 +104,10 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/files", get(list_files))
         .route("/file", get(read_file))
         .route("/logout", post(logout))
+        .route("/pair/start", post(pair_start))
+        .route("/pair/poll", post(pair_poll))
+        .route("/pair/lookup", get(pair_lookup))
+        .route("/pair/approve", post(pair_approve))
         .route("/account/me", get(account_me))
         .route("/account/password", post(change_password))
         .route("/account/connector-token", get(connector_token_status))
@@ -482,6 +486,112 @@ async fn account_me(State(state): State<Arc<ServerState>>, account: AuthedAccoun
         .into_response()
 }
 
+/// Device pairing (VR5 F1d) — OAuth device-flow style so the native app never
+/// makes a normal user copy a token. Four endpoints:
+///   start (public)   app → codes
+///   lookup (cookie)  browser → what device is asking
+///   approve (cookie) browser → yes, mint this account a token for it
+///   poll (public)    app → collect the token once approved
+#[derive(Deserialize)]
+struct PairStartBody {
+    #[serde(default)]
+    device_name: String,
+}
+
+/// The app begins pairing. No auth — pairing is what bootstraps it. Returns a
+/// secret `device_code` (app-held) and a short `user_code` the user confirms in
+/// the browser at `{server}/pair?code=<user_code>`.
+async fn pair_start(
+    State(state): State<Arc<ServerState>>,
+    axum::Json(body): axum::Json<PairStartBody>,
+) -> Response {
+    let name = if body.device_name.is_empty() { "a device" } else { &body.device_name };
+    let (device_code, user_code) = state.pair_start(name);
+    axum::Json(serde_json::json!({
+        "device_code": device_code,
+        "user_code": user_code,
+        "interval": 3,
+        "expires_in": 600,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PairPollBody {
+    device_code: String,
+}
+
+/// The app polls with its secret `device_code`. Public (the device_code is the
+/// capability). Returns the connector token exactly once, after approval.
+async fn pair_poll(
+    State(state): State<Arc<ServerState>>,
+    axum::Json(body): axum::Json<PairPollBody>,
+) -> Response {
+    use crate::state::PairPoll;
+    match state.pair_poll(&body.device_code) {
+        PairPoll::Pending => axum::Json(serde_json::json!({ "status": "pending" })).into_response(),
+        PairPoll::Approved { token } => {
+            axum::Json(serde_json::json!({ "status": "approved", "connector_token": token }))
+                .into_response()
+        }
+        PairPoll::Expired => {
+            axum::Json(serde_json::json!({ "status": "expired" })).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PairCodeQuery {
+    code: String,
+}
+
+/// The /pair page asks what device a `user_code` belongs to (so it can show the
+/// label being approved). Cookie-gated — only a logged-in user can look up.
+async fn pair_lookup(
+    State(state): State<Arc<ServerState>>,
+    _account: AuthedAccount,
+    Query(q): Query<PairCodeQuery>,
+) -> Response {
+    match state.pair_device_name(&q.code) {
+        Some(device_name) => axum::Json(serde_json::json!({ "device_name": device_name })).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such pairing").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PairApproveBody {
+    user_code: String,
+}
+
+/// The logged-in user approves a pairing. Mints this account a connector token
+/// and stashes it on the pairing for the app to collect via poll. Connector
+/// callers can't approve (they're machines, not the human at the browser).
+async fn pair_approve(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::Json(body): axum::Json<PairApproveBody>,
+) -> Response {
+    if account.is_connector {
+        return (StatusCode::FORBIDDEN, "not available for connector auth").into_response();
+    }
+    // Mint a fresh connector token for this account (single-token model, like
+    // rotate) and hand it to the pairing. NB: this rotates any existing token —
+    // pairing a new device supersedes the old one for now (per-device tokens =
+    // F1e follow-up).
+    let (raw, hash) = auth::generate_connector_token();
+    if !matches!(
+        state.accounts().set_connector_token_by_id(&account.account_id, &hash).await,
+        Ok(true)
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not mint token").into_response();
+    }
+    if state.pair_approve(&body.user_code, &account.account_id, &raw) {
+        (StatusCode::OK, "approved").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such pairing (expired?)").into_response()
+    }
+}
+
 /// Board key endpoint (docs/vision-round5-key-via-api-contract.md). Replaces two
 /// same-host mechanisms: the browser reading the key from the URL fragment, and
 /// the connector reading the escrow `.key` file off a shared disk (which breaks
@@ -708,6 +818,11 @@ fn is_public_path(path: &str) -> bool {
             | "/api/logout"
             | "/api/healthz"
             | "/api/s"
+            // Device pairing: the app has no session/token yet — that's what it's
+            // bootstrapping. `start` mints codes; `poll` returns the token only to
+            // the holder of the secret device_code. (approve/lookup ARE gated.)
+            | "/api/pair/start"
+            | "/api/pair/poll"
             | "/favicon.ico"
             | "/favicon.png"
             | "/robots.txt"
