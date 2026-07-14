@@ -1758,17 +1758,17 @@
   }
 
   // ── VR4 marquee select + group (physical gestures) ──────────────────────
-  // left-drag = move (Board.svelte); right-drag on empty canvas = marquee;
+  // left-drag on empty canvas = marquee select; left-drag on a node = move
   // right-click (no drag) on empty canvas = New Node menu. The native
   // `contextmenu` event is suppressed entirely (it fires at different moments
   // on different OSes); the menu is driven from pointerup-without-drag instead.
   let selectedIds = new Set<string>();
   // Marquee rect while dragging, in SCREEN (client) coords for the overlay.
   let marquee: { x: number; y: number; w: number; h: number } | null = null;
-  let rightPointer:
+  let marqueePointer:
     | { startX: number; startY: number; startPageX: number; startPageY: number; moved: boolean }
     | null = null;
-  // px of movement before a right-drag counts as a marquee (not a click → menu)
+  // px of movement before a left-drag counts as a marquee (not a click → deselect)
   // — a small floor so a shaky right-click still opens the menu (Le review).
   const MARQUEE_THRESHOLD = 5;
   // Board item kinds that are selectable/movable tiles (mirrors Board.svelte's
@@ -1777,77 +1777,75 @@
 
   function onFabricPointerDown(event: PointerEvent) {
     if (event.target !== fabricEl) return; // only the empty canvas background
-    if (event.button === 2) {
-      // Right-button → begin the menu-or-marquee gesture.
-      rightPointer = {
+    if (event.button === 0) {
+      // LEFT-button on empty canvas → marquee select (drag) / deselect (click).
+      // Pan lives on scroll+trackpad (TouchZoom), so left-drag here is free —
+      // matches the Figma-style "left-drag empties a selection box" instinct.
+      marqueePointer = {
         startX: event.clientX,
         startY: event.clientY,
         startPageX: event.pageX,
         startPageY: event.pageY,
         moved: false,
       };
-      window.addEventListener("pointermove", onRightPointerMove);
-      window.addEventListener("pointerup", onRightPointerUp);
-      window.addEventListener("pointercancel", onRightPointerCancel);
-    } else if (event.button === 0 && selectedIds.size > 0) {
-      // Left-click/pan on empty canvas clears the selection.
-      selectedIds = new Set();
+      window.addEventListener("pointermove", onMarqueePointerMove);
+      window.addEventListener("pointerup", onMarqueePointerUp);
+      window.addEventListener("pointercancel", onMarqueePointerCancel);
+    } else if (event.button === 2 && canEdit) {
+      // RIGHT-click on empty canvas → New Node menu right at the click point.
+      const [worldX, worldY] = normalizePosition(event);
+      contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
     }
   }
 
-  function onRightPointerMove(event: PointerEvent) {
-    if (!rightPointer) return;
-    const dx = event.clientX - rightPointer.startX;
-    const dy = event.clientY - rightPointer.startY;
-    if (!rightPointer.moved && dx * dx + dy * dy > MARQUEE_THRESHOLD * MARQUEE_THRESHOLD) {
-      rightPointer.moved = true;
+  function onMarqueePointerMove(event: PointerEvent) {
+    if (!marqueePointer) return;
+    const dx = event.clientX - marqueePointer.startX;
+    const dy = event.clientY - marqueePointer.startY;
+    if (!marqueePointer.moved && dx * dx + dy * dy > MARQUEE_THRESHOLD * MARQUEE_THRESHOLD) {
+      marqueePointer.moved = true;
     }
-    if (rightPointer.moved) {
+    if (marqueePointer.moved) {
       marquee = {
-        x: Math.min(rightPointer.startX, event.clientX),
-        y: Math.min(rightPointer.startY, event.clientY),
+        x: Math.min(marqueePointer.startX, event.clientX),
+        y: Math.min(marqueePointer.startY, event.clientY),
         w: Math.abs(dx),
         h: Math.abs(dy),
       };
       // Live highlight of nodes inside the frame as it's dragged (Le review).
       selectedIds = marqueeSelection(
-        rightPointer.startPageX,
-        rightPointer.startPageY,
+        marqueePointer.startPageX,
+        marqueePointer.startPageY,
         event.pageX,
         event.pageY,
       );
     }
   }
 
-  function onRightPointerUp(event: PointerEvent) {
-    const rp = rightPointer;
-    cleanupRightPointer();
-    if (!rp) return;
-    if (rp.moved) {
-      selectedIds = marqueeSelection(rp.startPageX, rp.startPageY, event.pageX, event.pageY);
-    } else if (canEdit) {
-      // No drag → the New Node menu at the release point.
-      const [worldX, worldY] = normalizePosition(event);
-      contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
+  function onMarqueePointerUp(event: PointerEvent) {
+    const mp = marqueePointer;
+    cleanupMarquee();
+    if (!mp) return;
+    if (mp.moved) {
+      // Commit the marquee selection (dragged a box over empty canvas).
+      selectedIds = marqueeSelection(mp.startPageX, mp.startPageY, event.pageX, event.pageY);
     } else {
-      makeToast({
-        kind: "info",
-        message: lockedForMe ? "Board is locked — read-only." : "Read-only — can't add nodes.",
-      });
+      // Plain left-click on empty canvas → deselect everything.
+      selectedIds = new Set();
     }
     marquee = null;
   }
 
-  function onRightPointerCancel() {
-    cleanupRightPointer();
+  function onMarqueePointerCancel() {
+    cleanupMarquee();
     marquee = null;
   }
 
-  function cleanupRightPointer() {
-    rightPointer = null;
-    window.removeEventListener("pointermove", onRightPointerMove);
-    window.removeEventListener("pointerup", onRightPointerUp);
-    window.removeEventListener("pointercancel", onRightPointerCancel);
+  function cleanupMarquee() {
+    marqueePointer = null;
+    window.removeEventListener("pointermove", onMarqueePointerMove);
+    window.removeEventListener("pointerup", onMarqueePointerUp);
+    window.removeEventListener("pointercancel", onMarqueePointerCancel);
   }
 
   /** Board items whose world bbox intersects the marquee rect (two screen
