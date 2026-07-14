@@ -104,6 +104,7 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/files", get(list_files))
         .route("/file", get(read_file))
         .route("/logout", post(logout))
+        .route("/account/me", get(account_me))
         .route("/account/password", post(change_password))
         .route("/account/connector-token", get(connector_token_status))
         .route("/account/connector-token/rotate", post(rotate_connector_token))
@@ -395,9 +396,15 @@ async fn connector_channel(state: Arc<ServerState>, account_id: String, socket: 
         .boards_for_account(&account_id)
         .await
         .unwrap_or_default();
-    if send_event(&mut sender, &crate::state::ConnectorEvent::Snapshot { boards })
-        .await
-        .is_err()
+    if send_event(
+        &mut sender,
+        &crate::state::ConnectorEvent::Snapshot {
+            account_id: account_id.clone(),
+            boards,
+        },
+    )
+    .await
+    .is_err()
     {
         state.connector_unregister(&account_id, id);
         return;
@@ -457,6 +464,19 @@ async fn connector_status(
 ) -> Response {
     let count = state.connector_count(&account.account_id);
     axum::Json(serde_json::json!({ "online": count > 0, "connectors": count })).into_response()
+}
+
+/// Who is the logged-in account? Returns `{account_id, username}` for the SPA —
+/// used to scope the agent-roster picker to the caller's own connector
+/// (`roster:<account_id>`), so a shared board never shows another account's
+/// agents in "Add agent".
+async fn account_me(State(state): State<Arc<ServerState>>, account: AuthedAccount) -> Response {
+    let username = match state.accounts().account_by_id(&account.account_id).await {
+        Ok(Some(a)) => a.username,
+        _ => return (StatusCode::UNAUTHORIZED, "login required").into_response(),
+    };
+    axum::Json(serde_json::json!({ "account_id": account.account_id, "username": username }))
+        .into_response()
 }
 
 /// Board key endpoint (docs/vision-round5-key-via-api-contract.md). Replaces two

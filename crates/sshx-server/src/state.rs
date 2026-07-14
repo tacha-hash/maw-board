@@ -42,6 +42,10 @@ pub enum ConnectorEvent {
     /// after connect. The connector reconciles against it: join boards it isn't
     /// serving yet, drop any it's serving that vanished.
     Snapshot {
+        /// The connector's own account id — so it can tag the agent rosters it
+        /// posts as `roster:<account_id>`, keeping each account's agents visible
+        /// only to that account (no cross-account leak on shared boards).
+        account_id: String,
         /// Every board name the account may serve at connect time.
         boards: Vec<String>,
     },
