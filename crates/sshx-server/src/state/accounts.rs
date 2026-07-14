@@ -39,6 +39,44 @@ pub enum JoinOutcome {
     UsernameTaken,
 }
 
+/// A member's capabilities on one board (F0.5). The board OWNER (role='owner')
+/// implicitly has every capability regardless of the flags — always resolve
+/// through [`may_edit`](Self::may_edit)/[`may_order`](Self::may_order), never the
+/// raw booleans.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MemberCapability {
+    /// 'owner' | 'member'.
+    pub role: String,
+    /// May modify board items (enforced as `can_write` at the WS handshake).
+    pub can_edit: bool,
+    /// May dispatch Work Orders to agents.
+    pub can_order: bool,
+}
+
+impl MemberCapability {
+    /// May this member modify board items? Owner always; otherwise per can_edit.
+    pub fn may_edit(&self) -> bool {
+        self.role == "owner" || self.can_edit
+    }
+    /// May this member dispatch Work Orders? Owner always; otherwise per can_order.
+    pub fn may_order(&self) -> bool {
+        self.role == "owner" || self.can_order
+    }
+}
+
+/// One board member row for the owner's member-management panel.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct MemberRow {
+    /// The member's login name.
+    pub username: String,
+    /// 'owner' | 'member'.
+    pub role: String,
+    /// May modify board items.
+    pub can_edit: bool,
+    /// May dispatch Work Orders.
+    pub can_order: bool,
+}
+
 fn now_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -412,6 +450,64 @@ impl AccountsDb {
         Ok(row.is_some())
     }
 
+    /// A member's capabilities on a board, or `None` if not a member. Used by
+    /// the WS handshake (can_write = cap.may_edit()) and the order gate.
+    pub async fn member_capabilities(
+        &self,
+        board_name: &str,
+        account_id: &str,
+    ) -> Result<Option<MemberCapability>> {
+        let row = sqlx::query_as::<_, MemberCapability>(
+            "SELECT role, can_edit, can_order FROM board_members \
+             WHERE board_name = ? AND account_id = ?",
+        )
+        .bind(board_name)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Every member of a board with role + capabilities (for the owner's member
+    /// panel), joined to `accounts` for the username. Owner listed first.
+    pub async fn list_members(&self, board_name: &str) -> Result<Vec<MemberRow>> {
+        let rows = sqlx::query_as::<_, MemberRow>(
+            "SELECT a.username, m.role, m.can_edit, m.can_order \
+             FROM board_members m JOIN accounts a ON a.id = m.account_id \
+             WHERE m.board_name = ? ORDER BY (m.role = 'owner') DESC, a.username",
+        )
+        .bind(board_name)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Set a member's capabilities by username. The owner's row is protected
+    /// (`role != 'owner'`), so an owner can never accidentally strip their own
+    /// access. Returns `false` if the username doesn't exist.
+    pub async fn set_member_capabilities(
+        &self,
+        board_name: &str,
+        username: &str,
+        can_edit: bool,
+        can_order: bool,
+    ) -> Result<bool> {
+        let Some(account) = self.account_by_username(username).await? else {
+            return Ok(false);
+        };
+        sqlx::query(
+            "UPDATE board_members SET can_edit = ?, can_order = ? \
+             WHERE board_name = ? AND account_id = ? AND role != 'owner'",
+        )
+        .bind(can_edit)
+        .bind(can_order)
+        .bind(board_name)
+        .bind(&account.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
     /// Names of every board an account is a member of (for the per-account
     /// lobby listing).
     pub async fn boards_for_account(&self, account_id: &str) -> Result<Vec<String>> {
@@ -538,6 +634,54 @@ mod tests {
         let a = db.bootstrap_account("louis", "hash-1").await.unwrap();
         let b = db.bootstrap_account("louis", "hash-2").await.unwrap();
         assert_eq!(a.id, b.id); // same account, not a duplicate
+    }
+
+    #[tokio::test]
+    async fn member_capabilities_default_owner_and_update() {
+        let db = db().await;
+        let louis = db.bootstrap_account("louis", "h").await.unwrap();
+        let code = db.create_invite(&louis.id).await.unwrap();
+        let JoinOutcome::Created(friend) = db.redeem_invite(&code, "friend", "h").await.unwrap()
+        else {
+            panic!("join failed");
+        };
+        db.create_board("b", &louis.id).await.unwrap();
+        db.add_member_by_username("b", "friend").await.unwrap();
+
+        // Owner: implicitly all capabilities regardless of the raw flags.
+        let owner = db.member_capabilities("b", &louis.id).await.unwrap().unwrap();
+        assert_eq!(owner.role, "owner");
+        assert!(owner.may_edit() && owner.may_order());
+
+        // Fresh member: backfill default can_edit=1, can_order=0.
+        let m = db.member_capabilities("b", &friend.id).await.unwrap().unwrap();
+        assert_eq!(m.role, "member");
+        assert!(m.can_edit && !m.can_order);
+        assert!(m.may_edit() && !m.may_order());
+
+        // Downgrade to view-only, then grant order.
+        assert!(db.set_member_capabilities("b", "friend", false, false).await.unwrap());
+        let m = db.member_capabilities("b", &friend.id).await.unwrap().unwrap();
+        assert!(!m.may_edit() && !m.may_order());
+        assert!(db.set_member_capabilities("b", "friend", true, true).await.unwrap());
+        let m = db.member_capabilities("b", &friend.id).await.unwrap().unwrap();
+        assert!(m.may_edit() && m.may_order());
+
+        // The owner row is protected from capability edits.
+        db.set_member_capabilities("b", "louis", false, false).await.unwrap();
+        let owner = db.member_capabilities("b", &louis.id).await.unwrap().unwrap();
+        assert!(owner.may_edit() && owner.may_order(), "owner caps unaffected");
+
+        // list_members: owner first, both present.
+        let members = db.list_members("b").await.unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].role, "owner");
+        assert_eq!(members[0].username, "louis");
+
+        // Unknown username → false; a non-member → None.
+        assert!(!db.set_member_capabilities("b", "ghost", true, true).await.unwrap());
+        let outsider = db.bootstrap_account("outsider", "h").await.unwrap();
+        assert!(db.member_capabilities("b", &outsider.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

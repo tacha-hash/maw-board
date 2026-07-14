@@ -24,6 +24,7 @@
     PlusCircleIcon,
     RadioIcon,
     SettingsIcon,
+    ShieldIcon,
     TerminalIcon,
     UsersIcon,
     VideoIcon,
@@ -42,6 +43,7 @@
   export let broadcastMode = false;
   export let numpadOpen = false;
   export let rosterOpen = false;
+  export let membersOpen = false;
 
   const dispatch = createEventDispatcher<{
     create: void;
@@ -56,6 +58,7 @@
     files: void;
     numpad: void;
     roster: void;
+    members: void;
     doc: void;
     chat: void;
     settings: void;
@@ -207,6 +210,14 @@
         title="Agent roster"
       >
         <UsersIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+      <button
+        class="icon-button"
+        class:active={membersOpen}
+        on:click={() => dispatch("members")}
+        title="Members & permissions"
+      >
+        <ShieldIcon strokeWidth={1.5} class="p-0.5" />
       </button>
       <button
         class="icon-button"

@@ -36,7 +36,21 @@ pub async fn get_session_ws(
         async move {
             match state.frontend_connect(&name).await {
                 Ok(Ok(session)) => {
-                    if let Err(err) = handle_socket(&mut socket, session, Some(account_id)).await {
+                    // VR5 F0.5: this account's board-item write capability. Owner
+                    // always may_edit; a member's can_edit flag decides. Missing
+                    // row (shouldn't happen — the connect gate proved membership)
+                    // fails closed to read-only.
+                    let can_edit = state
+                        .accounts()
+                        .member_capabilities(&name, &account_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|c| c.may_edit())
+                        .unwrap_or(false);
+                    if let Err(err) =
+                        handle_socket(&mut socket, session, Some(account_id), can_edit).await
+                    {
                         warn!(?err, "websocket exiting early");
                     } else {
                         socket.close().await.ok();
@@ -91,6 +105,7 @@ async fn handle_socket(
     socket: &mut WebSocket,
     session: Arc<Session>,
     account: Option<String>,
+    account_can_edit: bool,
 ) -> Result<()> {
     /// Send a message to the client over WebSocket.
     async fn send(socket: &mut WebSocket, msg: WsServer) -> Result<()> {
@@ -147,6 +162,12 @@ async fn handle_socket(
             return Ok(());
         }
     };
+
+    // VR5 F0.5: a view-only member (can_edit=0) is read-only even though the F0
+    // board carries no write password — capability gates board-item writes at
+    // the same check_write_permission choke-point. (Terminal input stays
+    // owner-only via may_mutate_shell regardless; this is a separate layer.)
+    let can_write = can_write && account_can_edit;
 
     let _user_guard = session.user_scope(user_id, can_write)?;
 

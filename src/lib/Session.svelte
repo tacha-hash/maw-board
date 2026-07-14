@@ -65,6 +65,7 @@
   import NodeDetail from "./ui/NodeDetail.svelte";
   import GroupMenu from "./ui/GroupMenu.svelte";
   import RosterSidebar from "./ui/RosterSidebar.svelte";
+  import MembersPanel from "./ui/MembersPanel.svelte";
   import { slide } from "./action/slide";
   import { TouchZoom, INITIAL_ZOOM } from "./action/touchZoom";
   import { arrangeNewTerminal } from "./arrange";
@@ -2013,6 +2014,33 @@
     groupMenu = null;
   }
 
+  // ── VR5 F0.5 members & permissions ───────────────────────────────────────
+  // The board owner manages who's on the board and their capability level
+  // (view/edit/order). `myCanOrder` gates the Work Order Dispatch button (a
+  // best-effort UX gate; edit is server-enforced, order enforcement is F1).
+  let showMembers = false;
+  let members: { username: string; role: string; can_edit: boolean; can_order: boolean }[] = [];
+  let myUsername = "";
+  $: myRow = members.find((m) => m.username === myUsername);
+  $: isOwner = myRow?.role === "owner";
+  // Optimistic until the roster loads (order is FE-gated only in F0.5, and a
+  // non-order edit could still dispatch server-side — the documented gap).
+  $: myCanOrder = !myUsername ? true : isOwner || !!myRow?.can_order;
+
+  async function refreshMembers() {
+    try {
+      const [meRes, mRes] = await Promise.all([
+        fetch("/api/account/me"),
+        fetch(`/api/boards/${encodeURIComponent(id)}/members`),
+      ]);
+      if (meRes.ok) myUsername = (await meRes.json()).username ?? "";
+      if (mRes.ok) members = await mRes.json();
+    } catch {
+      /* leave last-known roster; the panel can be reopened to retry */
+    }
+  }
+  onMount(refreshMembers);
+
   // Shared markdown document — a singleton board item synced to all peers
   // (hidden from the board canvas; shown only in the Document panel).
   const DOC_ID = "__shared_doc__";
@@ -3015,6 +3043,7 @@
       {broadcastMode}
       numpadOpen={showNumpad}
       rosterOpen={showRoster}
+      membersOpen={showMembers}
       on:create={() => handleCreate()}
       on:lock={toggleLock}
       on:broadcast={() => (broadcastMode = !broadcastMode)}
@@ -3026,6 +3055,10 @@
       on:video={handleVideoPick}
       on:files={() => (showExplorer = !showExplorer)}
       on:roster={() => (showRoster = !showRoster)}
+      on:members={() => {
+        showMembers = !showMembers;
+        if (showMembers) refreshMembers();
+      }}
       on:numpad={() => (showNumpad = !showNumpad)}
       on:doc={() => (showDoc = !showDoc)}
       on:chat={() => {
@@ -3121,6 +3154,17 @@
   {/if}
 
   <Settings open={settingsOpen} on:close={() => (settingsOpen = false)} />
+
+  {#if showMembers}
+    <MembersPanel
+      {members}
+      {isOwner}
+      {myUsername}
+      boardName={id}
+      on:changed={refreshMembers}
+      on:close={() => (showMembers = false)}
+    />
+  {/if}
 
   <YouTubePopup open={showYouTube} on:close={() => (showYouTube = false)} />
 
@@ -3263,6 +3307,7 @@
       extraGuidesV={termGuidesV}
       extraGuidesH={termGuidesH}
       {selectedIds}
+      canOrder={myCanOrder}
       on:clearSelection={clearSelection}
       on:nodeContextMenu={({ detail }) =>
         handleNodeContextMenu(detail.id, detail.clientX, detail.clientY)}

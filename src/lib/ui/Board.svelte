@@ -70,6 +70,10 @@
    * selection (the marquee lives on its fabric); Board reads it to highlight
    * members and to move the whole group when one member is dragged. */
   export let selectedIds: Set<string> = new Set();
+  /** VR5 F0.5: may this account dispatch Work Orders? Gates the Dispatch button
+   * (a UX gate; board-item edit is server-enforced, order enforcement is F1).
+   * Owner/legacy boards default to true. */
+  export let canOrder = true;
 
   // Screen-space snap distance; converted to world units (÷ zoom) so the pull
   // feels the same regardless of how far the board is zoomed.
@@ -1196,7 +1200,8 @@
           {#if hasWriteAccess !== false}
             <button
               class="job-btn job-btn-primary"
-              disabled={!order.prompt.trim() || !hasOlink}
+              disabled={!order.prompt.trim() || !hasOlink || !canOrder}
+              title={!canOrder ? "You don't have permission to dispatch Work Orders on this board" : undefined}
               on:pointerdown={(event) => event.stopPropagation()}
               on:click={() => dispatch("orderDispatch", item.id)}
             >

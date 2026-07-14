@@ -112,8 +112,11 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/boards/new", post(new_board))
         .route("/boards/{name}", delete(delete_board))
         .route("/boards/{name}/key", get(board_key))
-        .route("/boards/{name}/members", post(add_member))
-        .route("/boards/{name}/members/{username}", delete(remove_member))
+        .route("/boards/{name}/members", post(add_member).get(list_board_members))
+        .route(
+            "/boards/{name}/members/{username}",
+            delete(remove_member).patch(set_member_capabilities),
+        )
         .route("/healthz", get(healthz))
 }
 
@@ -924,6 +927,61 @@ async fn rotate_connector_token(
         return (StatusCode::INTERNAL_SERVER_ERROR, "could not rotate token").into_response();
     }
     axum::Json(serde_json::json!({ "token": raw })).into_response()
+}
+
+/// List a board's members with their roles + capabilities (VR5 F0.5), for the
+/// owner's member panel. Any member may read the roster; only the owner changes
+/// it. `/boards/*` isn't covered by the gate's membership check (that's `/s/`
+/// only), so membership is verified here — 404 (not 403) so a non-member can't
+/// probe board names.
+async fn list_board_members(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if !matches!(state.accounts().is_member(&name, &account.account_id).await, Ok(true)) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match state.accounts().list_members(&name).await {
+        Ok(members) => axum::Json(members).into_response(),
+        Err(err) => {
+            error!(?err, "list_members failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CapabilitiesBody {
+    can_edit: bool,
+    can_order: bool,
+}
+
+/// Set a member's capabilities on a board (VR5 F0.5) — owner-only. `can_order`
+/// implies `can_edit` (a member can't dispatch a Work Order they can't edit), so
+/// it's normalized here; the owner's own row is protected in the query layer.
+async fn set_member_capabilities(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::extract::Path((name, username)): axum::extract::Path<(String, String)>,
+    axum::Json(body): axum::Json<CapabilitiesBody>,
+) -> Response {
+    if !require_board_owner(&state, &name, &account.account_id).await {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let can_edit = body.can_edit || body.can_order; // order implies edit
+    match state
+        .accounts()
+        .set_member_capabilities(&name, &username, can_edit, body.can_order)
+        .await
+    {
+        Ok(true) => (StatusCode::OK, "updated").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such member").into_response(),
+        Err(err) => {
+            error!(?err, "set_member_capabilities failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]

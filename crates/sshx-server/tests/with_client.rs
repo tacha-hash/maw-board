@@ -853,3 +853,186 @@ async fn test_connector_token_rotate_and_status() -> Result<()> {
 
     Ok(())
 }
+
+/// VR5 F0.5 capabilities over HTTP: the owner can list members with their caps
+/// and set a member's can_edit/can_order (order implies edit); a member can't.
+#[tokio::test]
+async fn test_member_capabilities_http() -> Result<()> {
+    let mut options = ServerOptions::default();
+    options.insecure_cookies = true;
+    let server = TestServer::new_with_options(options).await;
+    let state = server.state();
+    let base = format!("http://{}", server.local_addr());
+
+    let oh = sshx_server::auth::hash_account_password("pw-owner").unwrap();
+    state.accounts().bootstrap_account("owner", &oh).await?;
+    let vh = sshx_server::auth::hash_account_password("pw-viewer").unwrap();
+    state.accounts().bootstrap_account("viewer", &vh).await?;
+
+    let owner = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    owner
+        .post(format!("{base}/login"))
+        .form(&[("username", "owner"), ("password", "pw-owner")])
+        .send()
+        .await?;
+    let nb: serde_json::Value = owner
+        .post(format!("{base}/api/boards/new"))
+        .json(&serde_json::json!({ "name": "caps" }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let name = nb["name"].as_str().unwrap().to_string();
+
+    // Share to viewer (owner-only).
+    assert_eq!(
+        owner
+            .post(format!("{base}/api/boards/{name}/members"))
+            .json(&serde_json::json!({ "username": "viewer" }))
+            .send()
+            .await?
+            .status(),
+        http::StatusCode::OK
+    );
+
+    let members_url = format!("{base}/api/boards/{name}/members");
+    let patch_url = format!("{base}/api/boards/{name}/members/viewer");
+    let viewer_caps = |arr: Vec<serde_json::Value>| {
+        arr.into_iter().find(|m| m["username"] == "viewer").unwrap()
+    };
+
+    // Default caps: member can_edit=1, can_order=0; owner listed with role owner.
+    let arr: Vec<serde_json::Value> = owner.get(&members_url).send().await?.json().await?;
+    assert!(arr.iter().any(|m| m["username"] == "owner" && m["role"] == "owner"));
+    let v = viewer_caps(arr);
+    assert_eq!(v["can_edit"], serde_json::json!(true));
+    assert_eq!(v["can_order"], serde_json::json!(false));
+
+    // Downgrade to view-only.
+    assert_eq!(
+        owner
+            .patch(&patch_url)
+            .json(&serde_json::json!({ "can_edit": false, "can_order": false }))
+            .send()
+            .await?
+            .status(),
+        http::StatusCode::OK
+    );
+    let arr: Vec<serde_json::Value> = owner.get(&members_url).send().await?.json().await?;
+    assert_eq!(viewer_caps(arr)["can_edit"], serde_json::json!(false));
+
+    // Granting order implies edit (normalized server-side).
+    owner
+        .patch(&patch_url)
+        .json(&serde_json::json!({ "can_edit": false, "can_order": true }))
+        .send()
+        .await?;
+    let arr: Vec<serde_json::Value> = owner.get(&members_url).send().await?.json().await?;
+    let v = viewer_caps(arr);
+    assert_eq!(v["can_edit"], serde_json::json!(true), "order implies edit");
+    assert_eq!(v["can_order"], serde_json::json!(true));
+
+    // A member can't manage capabilities — owner-only (404, not 403, so a
+    // non-owner can't even confirm the board exists this way).
+    let viewer = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    viewer
+        .post(format!("{base}/login"))
+        .form(&[("username", "viewer"), ("password", "pw-viewer")])
+        .send()
+        .await?;
+    assert_eq!(
+        viewer
+            .patch(&patch_url)
+            .json(&serde_json::json!({ "can_edit": true, "can_order": false }))
+            .send()
+            .await?
+            .status(),
+        http::StatusCode::NOT_FOUND
+    );
+
+    Ok(())
+}
+
+/// VR5 F0.5 capability enforcement at the WS layer: a member with can_edit=1
+/// may post board items; downgraded to view-only (can_edit=0) their BoardPut is
+/// rejected at the same check_write_permission choke-point — even though the F0
+/// board carries no write password.
+#[tokio::test]
+async fn test_view_only_member_cannot_write_board() -> Result<()> {
+    let mut options = ServerOptions::default();
+    options.insecure_cookies = true;
+    let server = TestServer::new_with_options(options).await;
+    let state = server.state();
+    let base = format!("http://{}", server.local_addr());
+
+    let oh = sshx_server::auth::hash_account_password("pw").unwrap();
+    state.accounts().bootstrap_account("owner", &oh).await?;
+    let vh = sshx_server::auth::hash_account_password("pw").unwrap();
+    let viewer = state.accounts().bootstrap_account("viewer", &vh).await?;
+
+    let web = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    web.post(format!("{base}/login"))
+        .form(&[("username", "owner"), ("password", "pw")])
+        .send()
+        .await?;
+    let nb: serde_json::Value = web
+        .post(format!("{base}/api/boards/new"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let name = nb["name"].as_str().unwrap().to_string();
+    let key = nb["key"].as_str().unwrap().to_string();
+
+    // viewer joins as a real member (role='member', default can_edit=1).
+    assert!(state.accounts().add_member_by_username(&name, "viewer").await?);
+    let viewer_cookie = format!(
+        "{}={}",
+        sshx_server::auth::SESSION_COOKIE,
+        sshx_server::auth::mint_session_cookie(state.mac(), &viewer.id, 3600)
+    );
+    let item = |id: &str| sshx_server::web::protocol::BoardItem {
+        id: id.into(),
+        kind: "note".into(),
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 100,
+        data_url: String::new(),
+    };
+
+    // Edit-capable member: BoardPut accepted (no error).
+    let mut editor =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&viewer_cookie)).await?;
+    editor.flush().await;
+    editor.send(WsClient::BoardPut(item("n1"))).await;
+    editor.flush().await;
+    assert!(editor.errors.is_empty(), "edit-member BoardPut accepted, got: {:?}", editor.errors);
+
+    // Owner downgrades viewer to view-only.
+    assert!(state.accounts().set_member_capabilities(&name, "viewer", false, false).await?);
+
+    // Reconnect: now read-only → BoardPut rejected at check_write_permission.
+    let mut ro =
+        ClientSocket::connect(&server.ws_endpoint(&name), &key, None, Some(&viewer_cookie)).await?;
+    ro.flush().await;
+    ro.send(WsClient::BoardPut(item("n2"))).await;
+    ro.flush().await;
+    assert!(
+        ro.errors.iter().any(|e| e.contains("No write permission")),
+        "view-only member's BoardPut must be rejected, got: {:?}",
+        ro.errors
+    );
+
+    Ok(())
+}
