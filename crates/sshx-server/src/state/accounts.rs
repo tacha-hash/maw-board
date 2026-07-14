@@ -115,6 +115,49 @@ impl AccountsDb {
         Ok(found.is_some())
     }
 
+    /// Look up an account by its opaque id (the id carried in a session cookie).
+    pub async fn account_by_id(&self, id: &str) -> Result<Option<Account>> {
+        let account = sqlx::query_as::<_, Account>(
+            "SELECT id, username, password_hash FROM accounts WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(account)
+    }
+
+    /// The account's session epoch (unix secs), or `None` if the account no
+    /// longer exists. A session cookie is valid only while its signed
+    /// `issued_at >= session_epoch`; the epoch is bumped on password change /
+    /// "logout everywhere", so this one read does double duty for the auth gate
+    /// (account-exists AND not-a-stale-session) — see [`crate::auth`] and the
+    /// `session_epoch` column comment in migrations/0001_accounts.sql.
+    pub async fn account_session_epoch(&self, id: &str) -> Result<Option<i64>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT session_epoch FROM accounts WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Set a new password hash AND bump `session_epoch` to now, atomically —
+    /// changing a password invalidates every session issued before this moment
+    /// (logout everywhere). The caller re-mints its own cookie afterwards so the
+    /// account that changed the password stays logged in. Returns `false` if no
+    /// such account id exists.
+    pub async fn set_password_and_bump_epoch(&self, id: &str, new_hash: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE accounts SET password_hash = ?, session_epoch = ? WHERE id = ?",
+        )
+        .bind(new_hash)
+        .bind(now_unix_secs())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// The account id owning a connector bearer token, looked up by the token's
     /// at-rest hash (see [`crate::auth::connector_token_hash`]). `None` if no
     /// account holds that token.
@@ -430,6 +473,31 @@ mod tests {
         // code2 must still be redeemable since the failed attempt didn't consume it.
         let ok = db.redeem_invite(&code2, "carol", "hash-c").await.unwrap();
         assert!(matches!(ok, JoinOutcome::Created(_)));
+    }
+
+    #[tokio::test]
+    async fn password_change_updates_hash_and_bumps_epoch() {
+        let db = db().await;
+        let acct = db.bootstrap_account("dave", "old-hash").await.unwrap();
+        // Fresh account: epoch starts at the schema default 0.
+        assert_eq!(db.account_session_epoch(&acct.id).await.unwrap(), Some(0));
+        assert_eq!(
+            db.account_by_id(&acct.id).await.unwrap().unwrap().password_hash.as_deref(),
+            Some("old-hash")
+        );
+
+        // Change → hash replaced AND epoch bumped to a real unix timestamp.
+        assert!(db.set_password_and_bump_epoch(&acct.id, "new-hash").await.unwrap());
+        assert_eq!(
+            db.account_by_id(&acct.id).await.unwrap().unwrap().password_hash.as_deref(),
+            Some("new-hash")
+        );
+        let epoch = db.account_session_epoch(&acct.id).await.unwrap().unwrap();
+        assert!(epoch > 0, "epoch should be bumped to a unix-secs timestamp, got {epoch}");
+
+        // Unknown id: no row → None / no-op.
+        assert_eq!(db.account_session_epoch("nope").await.unwrap(), None);
+        assert!(!db.set_password_and_bump_epoch("nope", "x").await.unwrap());
     }
 
     #[tokio::test]

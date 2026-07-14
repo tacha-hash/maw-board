@@ -104,6 +104,7 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/files", get(list_files))
         .route("/file", get(read_file))
         .route("/logout", post(logout))
+        .route("/account/password", post(change_password))
         .route("/boards", get(list_boards))
         .route("/boards/new", post(new_board))
         .route("/boards/{name}", delete(delete_board))
@@ -625,12 +626,19 @@ pub(crate) async fn session_auth_gate(
 /// token revokes access). Returns `None` when neither credential validates.
 async fn resolve_identity(state: &ServerState, headers: &HeaderMap) -> Option<AuthIdentity> {
     if let Some(claims) = session_from_headers(state, headers) {
-        // A cookie for a since-deleted account is not valid.
-        return matches!(state.accounts().account_exists(&claims.account_id).await, Ok(true))
-            .then_some(AuthIdentity {
+        // The account must still exist AND the cookie must be from the current
+        // session epoch: a password change / "logout everywhere" bumps
+        // session_epoch to now (unix secs), invalidating every cookie issued
+        // before it. One DB read covers both (account-gone → None row → reject;
+        // stale cookie → issued_at < epoch → reject). Connector bearer auth
+        // below is unaffected — it's revoked by rotating the token instead.
+        return match state.accounts().account_session_epoch(&claims.account_id).await {
+            Ok(Some(epoch)) if (claims.issued_at as i64) >= epoch => Some(AuthIdentity {
                 account_id: claims.account_id,
                 is_connector: false,
-            });
+            }),
+            _ => None,
+        };
     }
     if let Some(token) = bearer_token(headers) {
         let hash = auth::connector_token_hash(token);
@@ -853,6 +861,82 @@ async fn logout(State(state): State<Arc<ServerState>>) -> Response {
     let mut response = (StatusCode::OK, "logged out").into_response();
     if let Some(value) = header_value(&clear) {
         response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordBody {
+    old_password: String,
+    new_password: String,
+}
+
+/// New-password length bounds. The lower bound is a minimal usability floor; the
+/// upper bound caps the bytes Argon2 hashes per request so a very long password
+/// can't be used to burn server CPU (Le review Q5).
+const MIN_PASSWORD_LEN: usize = 8;
+const MAX_PASSWORD_LEN: usize = 256;
+
+/// Change the logged-in account's password (VR5 F0.5). Verifies the current
+/// password, stores a fresh Argon2id hash, and bumps `session_epoch` so every
+/// OTHER session is invalidated ("logout everywhere"); the caller's own cookie
+/// is re-minted so it stays logged in. Cookie auth only — a connector bearer
+/// token is a machine credential and cannot change a human's password.
+async fn change_password(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+    axum::Json(body): axum::Json<ChangePasswordBody>,
+) -> Response {
+    if account.is_connector {
+        return (StatusCode::FORBIDDEN, "not available for connector auth").into_response();
+    }
+    let new_len = body.new_password.len();
+    if new_len < MIN_PASSWORD_LEN || new_len > MAX_PASSWORD_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            "new password must be 8–256 characters",
+        )
+            .into_response();
+    }
+
+    // Verify the current password against the stored hash (constant-time inside
+    // the verifier). A passkey-only account (no hash) can't change via password.
+    let acct = match state.accounts().account_by_id(&account.account_id).await {
+        Ok(Some(a)) => a,
+        _ => return (StatusCode::UNAUTHORIZED, "login required").into_response(),
+    };
+    let old_ok = acct
+        .password_hash
+        .as_deref()
+        .is_some_and(|h| auth::verify_account_password(&body.old_password, h));
+    if !old_ok {
+        return (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response();
+    }
+
+    let new_hash = match auth::hash_account_password(&body.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            error!(?e, "argon2 hashing failed on password change");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not set password").into_response();
+        }
+    };
+    if !matches!(
+        state
+            .accounts()
+            .set_password_and_bump_epoch(&account.account_id, &new_hash)
+            .await,
+        Ok(true)
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not set password").into_response();
+    }
+
+    // Re-mint this session's cookie (fresh issued_at >= the new epoch) so the
+    // account that just changed its password isn't logged out too.
+    let value = auth::mint_session_cookie(state.mac(), &account.account_id, SESSION_TTL_SECS);
+    let set_cookie = auth::session_set_cookie(&value, SESSION_TTL_SECS, !state.insecure_cookies());
+    let mut response = (StatusCode::OK, "password changed").into_response();
+    if let Some(v) = header_value(&set_cookie) {
+        response.headers_mut().append(header::SET_COOKIE, v);
     }
     response
 }

@@ -681,3 +681,108 @@ async fn test_healthz() -> Result<()> {
 
     Ok(())
 }
+
+/// VR5 F0.5 change-password: verifies the current password, enforces the length
+/// policy, keeps the caller logged in (cookie re-mint), and — via the
+/// session_epoch bump wired into resolve_identity — signs out every OTHER
+/// session and invalidates the old password.
+#[tokio::test]
+async fn test_change_password_and_epoch_logout() -> Result<()> {
+    let mut options = ServerOptions::default();
+    options.insecure_cookies = true; // plain-HTTP test login
+    let server = TestServer::new_with_options(options).await;
+    let state = server.state();
+    let base = format!("http://{}", server.local_addr());
+
+    let hash = sshx_server::auth::hash_account_password("old-password-1").unwrap();
+    state.accounts().bootstrap_account("carol", &hash).await?;
+
+    let new_client = || {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+    };
+    let login = |c: reqwest::Client, pw: &'static str| {
+        let base = base.clone();
+        async move {
+            c.post(format!("{base}/login"))
+                .form(&[("username", "carol"), ("password", pw)])
+                .send()
+                .await
+        }
+    };
+
+    // An "other device" session logs in first. A real time gap makes its
+    // cookie's issued_at strictly earlier than the epoch the later password
+    // change sets, sidestepping the 1-second same-timestamp edge.
+    let other = new_client()?;
+    let r = login(other.clone(), "old-password-1").await?;
+    assert_eq!(r.status(), http::StatusCode::SEE_OTHER, "login should 303");
+    assert_eq!(
+        other.get(format!("{base}/api/boards")).send().await?.status(),
+        http::StatusCode::OK,
+        "other session authed before the change"
+    );
+
+    time::sleep(Duration::from_millis(1100)).await;
+
+    // The "current device" logs in and changes the password.
+    let cur = new_client()?;
+    login(cur.clone(), "old-password-1").await?;
+
+    let pw_url = format!("{base}/api/account/password");
+    // Wrong current password → 401.
+    let r = cur
+        .post(&pw_url)
+        .json(&serde_json::json!({"old_password":"wrong","new_password":"a-good-new-password"}))
+        .send()
+        .await?;
+    assert_eq!(r.status(), http::StatusCode::UNAUTHORIZED);
+    // Too-short new password → 400.
+    let r = cur
+        .post(&pw_url)
+        .json(&serde_json::json!({"old_password":"old-password-1","new_password":"short"}))
+        .send()
+        .await?;
+    assert_eq!(r.status(), http::StatusCode::BAD_REQUEST);
+    // Correct → 200; the response re-mints this session's cookie.
+    let r = cur
+        .post(&pw_url)
+        .json(&serde_json::json!({"old_password":"old-password-1","new_password":"new-password-2"}))
+        .send()
+        .await?;
+    assert_eq!(r.status(), http::StatusCode::OK);
+
+    // The current session stays logged in (re-minted cookie >= the new epoch)…
+    assert_eq!(
+        cur.get(format!("{base}/api/boards")).send().await?.status(),
+        http::StatusCode::OK,
+        "the session that changed the password stays logged in"
+    );
+    // …while every OTHER session is signed out (its pre-epoch cookie rejected).
+    assert_eq!(
+        other.get(format!("{base}/api/boards")).send().await?.status(),
+        http::StatusCode::UNAUTHORIZED,
+        "logout everywhere: the pre-change cookie is now rejected"
+    );
+
+    // The old password no longer authenticates; the new one does.
+    let fresh = new_client()?;
+    assert_eq!(
+        login(fresh.clone(), "old-password-1").await?.status(),
+        http::StatusCode::UNAUTHORIZED,
+        "old password must be rejected"
+    );
+    assert_eq!(
+        login(fresh.clone(), "new-password-2").await?.status(),
+        http::StatusCode::SEE_OTHER,
+        "new password must log in"
+    );
+    assert_eq!(
+        fresh.get(format!("{base}/api/boards")).send().await?.status(),
+        http::StatusCode::OK
+    );
+
+    Ok(())
+}
