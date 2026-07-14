@@ -19,6 +19,10 @@
   // pixel offset to start below it — a fixed CSS top overlapped it
   // whenever enough people were connected (Louis hit this live).
   export let topPx = 80;
+  // VR5 F0.5 wizard: is this account's connector live on the control channel?
+  // Adding an agent needs one running, so "New agent" is gated on it. Defaults
+  // true so a legacy/non-account board never blocks.
+  export let connectorOnline = true;
 
   const MODELS = ["sonnet", "opus", "haiku"];
 
@@ -83,9 +87,18 @@
     </button>
   </div>
 
+  {#if !connectorOnline}
+    <div class="offline">
+      <span class="dot-off"></span>
+      No connector online. <a class="link" href="/account">Set one up</a> to run your agents.
+    </div>
+  {/if}
+
   <div class="list">
     {#if agents.length === 0}
-      <p class="muted">Waiting for roster from bridge…</p>
+      <p class="muted">
+        {#if connectorOnline}Waiting for roster from bridge…{:else}No agents yet.{/if}
+      </p>
     {/if}
     {#each agents as agent (agent.name)}
       {@const mirrored = onBoard.has(agent.name)}
@@ -192,7 +205,12 @@
       </div>
     </div>
   {:else}
-    <button class="new-agent" disabled={!canEdit} on:click={() => (showForm = true)}>
+    <button
+      class="new-agent"
+      disabled={!canEdit || !connectorOnline}
+      title={!connectorOnline ? "Start your connector first (Account settings)" : undefined}
+      on:click={() => (showForm = true)}
+    >
       <PlusIcon size="14" />
       New agent
     </button>
@@ -259,6 +277,15 @@
   }
   .muted {
     @apply px-3 py-1 text-xs text-zinc-500;
+  }
+  .offline {
+    @apply flex items-center gap-1.5 mx-2 mt-2 px-2.5 py-1.5 rounded-md text-[11px] text-amber-200/90 bg-amber-500/10 ring-1 ring-amber-500/25;
+  }
+  .dot-off {
+    @apply w-2 h-2 rounded-full bg-amber-400 flex-none;
+  }
+  .link {
+    @apply underline text-amber-200 hover:text-amber-100;
   }
   .new-agent {
     @apply flex items-center justify-center gap-1.5 mx-2 my-2 px-2 py-1.5 rounded-md text-xs text-zinc-300;

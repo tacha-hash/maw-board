@@ -1563,8 +1563,31 @@
   // per Le 2026-07-06 ค่ำ) is a name->"live"|"sleeping" map, not part of
   // each agent entry itself — merged in here so RosterSidebar just reads
   // agent.status directly.
+  // VR5 roster isolation: the portable connector posts a per-account roster
+  // item (`roster:<account_id>`) so you only see YOUR machine's agents, not
+  // every connector's. Prefer that; fall back to the legacy singleton `roster`
+  // for boards still served by an old bridge during the transition.
   const ROSTER_ID = "roster";
-  $: rosterItem = boardItems.find((it) => it.id === ROSTER_ID);
+  $: rosterItem =
+    (myAccountId ? boardItems.find((it) => it.id === `roster:${myAccountId}`) : undefined) ??
+    boardItems.find((it) => it.id === ROSTER_ID);
+
+  // Is this account's connector live? Polled so the roster's "New agent" gate
+  // and its offline hint update within a few seconds of the connector pairing.
+  let connectorOnline = false;
+  async function pollConnectorStatus() {
+    try {
+      const res = await fetch("/api/connector/status");
+      if (res.ok) connectorOnline = !!(await res.json()).online;
+    } catch {
+      /* transient — keep last known */
+    }
+  }
+  onMount(() => {
+    pollConnectorStatus();
+    const t = setInterval(pollConnectorStatus, 3000);
+    return () => clearInterval(t);
+  });
   $: roster = ((): { agents: { name: string; host?: string; status?: string }[] } => {
     try {
       if (!rosterItem?.dataUrl) return { agents: [] };
@@ -2021,6 +2044,7 @@
   let showMembers = false;
   let members: { username: string; role: string; can_edit: boolean; can_order: boolean }[] = [];
   let myUsername = "";
+  let myAccountId = "";
   $: myRow = members.find((m) => m.username === myUsername);
   $: isOwner = myRow?.role === "owner";
   // Optimistic until the roster loads (order is FE-gated only in F0.5, and a
@@ -2033,7 +2057,11 @@
         fetch("/api/account/me"),
         fetch(`/api/boards/${encodeURIComponent(id)}/members`),
       ]);
-      if (meRes.ok) myUsername = (await meRes.json()).username ?? "";
+      if (meRes.ok) {
+        const me = await meRes.json();
+        myUsername = me.username ?? "";
+        myAccountId = me.account_id ?? "";
+      }
       if (mRes.ok) members = await mRes.json();
     } catch {
       /* leave last-known roster; the panel can be reopened to retry */
@@ -3178,6 +3206,7 @@
   {#if showRoster}
     <RosterSidebar
       agents={roster.agents}
+      {connectorOnline}
       onBoard={mirroredAgents}
       topPx={rosterTopPx}
       {canEdit}
