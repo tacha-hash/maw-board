@@ -278,8 +278,16 @@ export class TouchZoom {
   #handleDrag: Handler<
     "drag",
     MouseEvent | PointerEvent | TouchEvent | KeyboardEvent
-  > = ({ delta, elapsedTime }) => {
+  > = ({ delta, elapsedTime, event }) => {
     if (this.isPinching) return;
+    // A left-drag on empty canvas is the VR4 marquee (Session.onFabricPointerDown),
+    // NOT a pan. A real mouse fires BOTH this drag-pan and the marquee at once, and
+    // they fight — the view pans out from under the selection box so the marquee
+    // ends up selecting nothing. Mouse panning is wheel/trackpad only by design
+    // (docs/vision-round4-marquee-group-design.md); keep drag-pan for touch/pen.
+    // Found via real-mouse verification; a synthetic dispatch never drives
+    // @use-gesture, so this slipped past the marquee's earlier check.
+    if (event && "pointerType" in event && (event as PointerEvent).pointerType === "mouse") return;
     if (delta[0] === 0 && delta[1] === 0 && elapsedTime < 200) return;
     this.center = Vec.sub(this.center, Vec.div(delta, this.zoom));
     this.#moved();
