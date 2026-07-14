@@ -786,3 +786,70 @@ async fn test_change_password_and_epoch_logout() -> Result<()> {
 
     Ok(())
 }
+
+/// VR5 F0.5 connector-token view/rotate over HTTP: a browser session can see
+/// whether a token is configured and mint/rotate one (shown once); rotating
+/// invalidates the previous token; a connector bearer can't rotate.
+#[tokio::test]
+async fn test_connector_token_rotate_and_status() -> Result<()> {
+    let mut options = ServerOptions::default();
+    options.insecure_cookies = true;
+    let server = TestServer::new_with_options(options).await;
+    let state = server.state();
+    let base = format!("http://{}", server.local_addr());
+
+    let hash = sshx_server::auth::hash_account_password("pw-erin").unwrap();
+    state.accounts().bootstrap_account("erin", &hash).await?;
+
+    let web = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    web.post(format!("{base}/login"))
+        .form(&[("username", "erin"), ("password", "pw-erin")])
+        .send()
+        .await?;
+
+    let status_url = format!("{base}/api/account/connector-token");
+    let rotate_url = format!("{base}/api/account/connector-token/rotate");
+
+    // Before rotate: not configured.
+    let s: serde_json::Value = web.get(&status_url).send().await?.json().await?;
+    assert_eq!(s["configured"], serde_json::json!(false));
+
+    // Rotate → returns a 32-char raw token once, and flips to configured.
+    let r: serde_json::Value = web.post(&rotate_url).send().await?.json().await?;
+    let token1 = r["token"].as_str().unwrap().to_string();
+    assert_eq!(token1.len(), 32, "token is 32 alphanumeric chars");
+    let s: serde_json::Value = web.get(&status_url).send().await?.json().await?;
+    assert_eq!(s["configured"], serde_json::json!(true));
+
+    // The token authenticates as a connector bearer (discovery via /api/boards).
+    let bearer = reqwest::Client::new();
+    assert_eq!(
+        bearer.get(format!("{base}/api/boards")).bearer_auth(&token1).send().await?.status(),
+        http::StatusCode::OK
+    );
+
+    // Rotate again → a different token; the OLD one no longer authenticates.
+    let r: serde_json::Value = web.post(&rotate_url).send().await?.json().await?;
+    let token2 = r["token"].as_str().unwrap().to_string();
+    assert_ne!(token1, token2);
+    assert_eq!(
+        bearer.get(format!("{base}/api/boards")).bearer_auth(&token1).send().await?.status(),
+        http::StatusCode::UNAUTHORIZED,
+        "old token is invalidated by a rotate"
+    );
+    assert_eq!(
+        bearer.get(format!("{base}/api/boards")).bearer_auth(&token2).send().await?.status(),
+        http::StatusCode::OK
+    );
+
+    // A connector bearer can't rotate the token it's authenticating with.
+    assert_eq!(
+        bearer.post(&rotate_url).bearer_auth(&token2).send().await?.status(),
+        http::StatusCode::FORBIDDEN
+    );
+
+    Ok(())
+}

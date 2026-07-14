@@ -100,6 +100,18 @@ pub fn connector_token_hash(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Mint a fresh connector bearer token: returns `(raw, at_rest_hash)`. The raw
+/// token (32 high-entropy alphanumeric chars) is shown to the user exactly once;
+/// only its hash is stored. This is the SINGLE source of the token's format and
+/// hashing, shared by the `connector-token` CLI subcommand and the
+/// `/api/account/connector-token/rotate` HTTP endpoint so the two can never
+/// drift apart (Le review).
+pub fn generate_connector_token() -> (String, String) {
+    let raw = sshx_core::rand_alphanumeric(32);
+    let hash = connector_token_hash(&raw);
+    (raw, hash)
+}
+
 /// Mint a signed, stateless session cookie binding `account_id` for
 /// `ttl_secs`. Value format: `v1:<account_id>:<issued_at>:<expires>:<b64url
 /// (hmac)>`, signed with the server MAC. The `:` delimiters give unambiguous

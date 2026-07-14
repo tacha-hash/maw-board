@@ -105,6 +105,8 @@ fn backend() -> Router<Arc<ServerState>> {
         .route("/file", get(read_file))
         .route("/logout", post(logout))
         .route("/account/password", post(change_password))
+        .route("/account/connector-token", get(connector_token_status))
+        .route("/account/connector-token/rotate", post(rotate_connector_token))
         .route("/boards", get(list_boards))
         .route("/boards/new", post(new_board))
         .route("/boards/{name}", delete(delete_board))
@@ -863,6 +865,45 @@ async fn logout(State(state): State<Arc<ServerState>>) -> Response {
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
+}
+
+/// Whether the logged-in account has a connector token configured (VR5 F0.5).
+/// The raw token is unrecoverable (only its hash is stored), so this is a
+/// boolean status the /account UI uses to show "configured / set one up" — it
+/// can never re-display the token itself. Cookie auth only.
+async fn connector_token_status(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+) -> Response {
+    if account.is_connector {
+        return (StatusCode::FORBIDDEN, "not available for connector auth").into_response();
+    }
+    let configured = matches!(
+        state.accounts().connector_token_configured(&account.account_id).await,
+        Ok(true)
+    );
+    axum::Json(serde_json::json!({ "configured": configured })).into_response()
+}
+
+/// Mint (or rotate) the logged-in account's connector bearer token, returning
+/// the raw token exactly once (the server keeps only its hash). Rotating
+/// immediately invalidates any previous token. Cookie auth only — a connector
+/// can't rotate the token it's currently authenticating with.
+async fn rotate_connector_token(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+) -> Response {
+    if account.is_connector {
+        return (StatusCode::FORBIDDEN, "not available for connector auth").into_response();
+    }
+    let (raw, hash) = auth::generate_connector_token();
+    if !matches!(
+        state.accounts().set_connector_token_by_id(&account.account_id, &hash).await,
+        Ok(true)
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not rotate token").into_response();
+    }
+    axum::Json(serde_json::json!({ "token": raw })).into_response()
 }
 
 #[derive(Deserialize)]

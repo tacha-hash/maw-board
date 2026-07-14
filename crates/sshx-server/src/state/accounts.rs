@@ -181,6 +181,31 @@ impl AccountsDb {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Set (or rotate) the connector token hash for an account, by id (the id a
+    /// session cookie carries — used by the `/account` rotate endpoint). Returns
+    /// `false` if no such account id exists.
+    pub async fn set_connector_token_by_id(&self, id: &str, token_hash: &str) -> Result<bool> {
+        let res = sqlx::query("UPDATE accounts SET connector_token = ? WHERE id = ?")
+            .bind(token_hash)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Whether an account currently has a connector token configured. The raw
+    /// token is unrecoverable (only its hash is stored), so the `/account` UI can
+    /// show "configured / not configured" but never re-display the token.
+    pub async fn connector_token_configured(&self, id: &str) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM accounts WHERE id = ? AND connector_token IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     /// Directly create an account, bypassing the invite flow — for the
     /// `migrate-vr5` bootstrap of the "louis" account only (the chicken-egg:
     /// the very first account can't be created *through* an invite, since

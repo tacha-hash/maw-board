@@ -223,9 +223,9 @@ async fn run_migrate_vr5(args: MigrateArgs) -> Result<()> {
 #[tokio::main]
 async fn run_connector_token(args: ConnectorTokenArgs) -> Result<()> {
     let db = AccountsDb::new(Some(&args.persist_dir)).await?;
-    // High-entropy random token; only its SHA-256 is stored server-side.
-    let token = sshx_core::rand_alphanumeric(32);
-    let hash = auth::connector_token_hash(&token);
+    // Shared mint helper — identical token format/hashing as the HTTP rotate
+    // endpoint (auth::generate_connector_token), so CLI and web can't drift.
+    let (token, hash) = auth::generate_connector_token();
     if !db.set_connector_token(&args.username, &hash).await? {
         return Err(anyhow!(
             "no account '{}' — create it (or run `migrate-vr5`) first",
