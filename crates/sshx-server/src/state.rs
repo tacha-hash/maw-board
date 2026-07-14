@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
 use sshx_core::{rand_alphanumeric, BackendId};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::error;
@@ -29,6 +30,50 @@ pub mod mesh;
 /// then its updated timestamp will be out-of-date, so we close it and remove it
 /// from the state to reduce memory usage.
 const DISCONNECTED_SESSION_EXPIRY: Duration = Duration::from_secs(300);
+
+/// A control-channel frame pushed from the server to a connected connector
+/// (Vision Round 5 F1a). The connector consumes these instead of polling
+/// `/api/boards`, so a new/shared board is served in ~0s instead of one poll
+/// interval, and the server knows in real time which connectors are online.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+pub enum ConnectorEvent {
+    /// The full set of board names this account should serve, sent once right
+    /// after connect. The connector reconciles against it: join boards it isn't
+    /// serving yet, drop any it's serving that vanished.
+    Snapshot {
+        /// Every board name the account may serve at connect time.
+        boards: Vec<String>,
+    },
+    /// Begin serving one board (it was just created by, or shared to, this
+    /// account).
+    Serve {
+        /// The board name to start serving.
+        board: String,
+    },
+    /// Stop serving one board (deleted, or unshared from this account).
+    Unserve {
+        /// The board name to stop serving.
+        board: String,
+    },
+    /// Heartbeat, so an idle channel isn't mistaken for dead by intermediaries.
+    Ping,
+}
+
+/// One live connector control channel: an id (to unregister the exact
+/// connection on disconnect) and the sender half of its outbound event queue.
+struct ConnectorHandle {
+    id: u64,
+    tx: mpsc::UnboundedSender<ConnectorEvent>,
+}
+
+/// All live connectors for a single account. A user may run the connector on
+/// several machines at once, so this is a list, not a single handle.
+#[derive(Default)]
+struct ConnectorRegistry {
+    handles: Vec<ConnectorHandle>,
+    next_id: u64,
+}
 
 /// Shared state object for global server logic.
 pub struct ServerState {
@@ -61,6 +106,11 @@ pub struct ServerState {
 
     /// Account/invite/board-ownership database (Vision Round 5 F0).
     accounts: AccountsDb,
+
+    /// Per-account connector control channels (Vision Round 5 F1a). Keyed by
+    /// account id; the value holds every live connector that account has open.
+    /// Used to push serve/unserve events and to report connector-online status.
+    connectors: DashMap<String, ConnectorRegistry>,
 }
 
 impl ServerState {
@@ -93,12 +143,51 @@ impl ServerState {
             oracle_url_file,
             static_dir,
             accounts,
+            connectors: DashMap::new(),
         })
     }
 
     /// Returns the account/invite/board-ownership database.
     pub fn accounts(&self) -> &AccountsDb {
         &self.accounts
+    }
+
+    /// Register a connector control channel for `account_id`. Returns the
+    /// connection id (pass it back to [`Self::connector_unregister`] on
+    /// disconnect) and the receiver the WS handler forwards to the socket.
+    pub fn connector_register(
+        &self,
+        account_id: &str,
+    ) -> (u64, mpsc::UnboundedReceiver<ConnectorEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut entry = self.connectors.entry(account_id.to_string()).or_default();
+        let id = entry.next_id;
+        entry.next_id += 1;
+        entry.handles.push(ConnectorHandle { id, tx });
+        (id, rx)
+    }
+
+    /// Drop a connector control channel by the id from
+    /// [`Self::connector_register`]. Idempotent.
+    pub fn connector_unregister(&self, account_id: &str, id: u64) {
+        if let Some(mut entry) = self.connectors.get_mut(account_id) {
+            entry.handles.retain(|h| h.id != id);
+        }
+    }
+
+    /// How many connectors are live for `account_id` — the "connector online"
+    /// signal the web surfaces.
+    pub fn connector_count(&self, account_id: &str) -> usize {
+        self.connectors.get(account_id).map_or(0, |e| e.handles.len())
+    }
+
+    /// Push an event to every live connector of `account_id`, dropping any whose
+    /// receiver has closed (the connection died without unregistering). A no-op
+    /// when the account has no connector online.
+    pub fn connector_push(&self, account_id: &str, event: ConnectorEvent) {
+        if let Some(mut entry) = self.connectors.get_mut(account_id) {
+            entry.handles.retain(|h| h.tx.send(event.clone()).is_ok());
+        }
     }
 
     /// Returns the message authentication code used for signing tokens.

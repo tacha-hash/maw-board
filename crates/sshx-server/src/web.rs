@@ -5,11 +5,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, Query, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, get_service};
 use axum::Router;
+use futures_util::{SinkExt, StreamExt};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
@@ -96,6 +98,8 @@ fn backend() -> Router<Arc<ServerState>> {
     use axum::routing::{delete, post};
     Router::new()
         .route("/s/{name}", any(socket::get_session_ws))
+        .route("/connector", any(get_connector_ws))
+        .route("/connector/status", get(connector_status))
         .route("/sysstat", get(sysstat))
         .route("/files", get(list_files))
         .route("/file", get(read_file))
@@ -168,6 +172,12 @@ async fn new_board(
         error!(?err, "failed to record board ownership");
         return (StatusCode::INTERNAL_SERVER_ERROR, "failed to create board").into_response();
     }
+    // Push the new board to the owner's connector(s) so it's served immediately
+    // over the control channel — no poll-interval wait. No-op if none online.
+    state.connector_push(
+        &account.account_id,
+        crate::state::ConnectorEvent::Serve { board: name.clone() },
+    );
     let jt_for_escrow = crate::grpc::join_token(state.mac(), &name);
     if let Some(disk) = state.disk() {
         if let Ok(snapshot) = session.snapshot() {
@@ -219,6 +229,11 @@ async fn delete_board(
         // log the row-cleanup failure (a stale ownership row is harmless — the
         // board can't be reopened once its snapshot is deleted).
     }
+    // Tell the owner's connector(s) to stop serving the now-deleted board.
+    state.connector_push(
+        &account.account_id,
+        crate::state::ConnectorEvent::Unserve { board: name.clone() },
+    );
     (StatusCode::OK, "deleted").into_response()
 }
 
@@ -290,7 +305,17 @@ async fn add_member(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     match state.accounts().add_member_by_username(&name, &body.username).await {
-        Ok(true) => (StatusCode::OK, "added").into_response(),
+        Ok(true) => {
+            // Push the shared board to the new member's connector(s) so their
+            // agents can join it right away, without waiting for a reconnect.
+            if let Ok(Some(member)) = state.accounts().account_by_username(&body.username).await {
+                state.connector_push(
+                    &member.id,
+                    crate::state::ConnectorEvent::Serve { board: name.clone() },
+                );
+            }
+            (StatusCode::OK, "added").into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "no such user").into_response(),
         Err(err) => {
             error!(?err, "add_member failed");
@@ -309,7 +334,17 @@ async fn remove_member(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     match state.accounts().remove_member_by_username(&name, &username).await {
-        Ok(_) => (StatusCode::OK, "removed").into_response(),
+        Ok(_) => {
+            // Tell the removed member's connector(s) to stop serving the board
+            // their access was just revoked from.
+            if let Ok(Some(member)) = state.accounts().account_by_username(&username).await {
+                state.connector_push(
+                    &member.id,
+                    crate::state::ConnectorEvent::Unserve { board: name.clone() },
+                );
+            }
+            (StatusCode::OK, "removed").into_response()
+        }
         Err(err) => {
             error!(?err, "remove_member failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response()
@@ -321,6 +356,104 @@ async fn remove_member(
 /// administration (delete, membership changes).
 async fn require_board_owner(state: &ServerState, name: &str, account_id: &str) -> bool {
     matches!(state.accounts().board_owner(name).await, Ok(Some(owner)) if owner == account_id)
+}
+
+/// The connector control channel (Vision Round 5 F1a): a persistent WebSocket
+/// the connector opens so the server can *push* which boards to serve, instead
+/// of the connector polling `/api/boards`. Authentication is the connector-token
+/// (`Authorization: Bearer …`), enforced by [`session_auth_gate`] like every
+/// other `/api` route; a browser session cookie is rejected here (`is_connector`
+/// must be true) because this is a machine-pairing primitive, not a browser
+/// surface. The connector's presence on this channel is exactly what "connector
+/// online" means on the web (see [`connector_status`]).
+async fn get_connector_ws(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !account.is_connector {
+        return (StatusCode::FORBIDDEN, "connector token required").into_response();
+    }
+    let account_id = account.account_id;
+    ws.on_upgrade(move |socket| connector_channel(state, account_id, socket))
+}
+
+/// Drive one connector control-channel connection: register it, send the initial
+/// board snapshot, then forward pushed events and heartbeats until the socket
+/// closes (whereupon it unregisters, updating online status).
+async fn connector_channel(state: Arc<ServerState>, account_id: String, socket: WebSocket) {
+    let (id, mut rx) = state.connector_register(&account_id);
+    let (mut sender, mut receiver) = socket.split();
+
+    // Initial snapshot: every board this account may serve right now. The
+    // connector reconciles its running backends against this set.
+    let boards = state
+        .accounts()
+        .boards_for_account(&account_id)
+        .await
+        .unwrap_or_default();
+    if send_event(&mut sender, &crate::state::ConnectorEvent::Snapshot { boards })
+        .await
+        .is_err()
+    {
+        state.connector_unregister(&account_id, id);
+        return;
+    }
+
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+    heartbeat.tick().await; // the first tick fires immediately — skip it.
+
+    loop {
+        tokio::select! {
+            // Server → connector: a serve/unserve/ping was pushed for this account.
+            evt = rx.recv() => match evt {
+                Some(evt) => {
+                    if send_event(&mut sender, &evt).await.is_err() {
+                        break;
+                    }
+                }
+                None => break, // registry dropped (only on shutdown)
+            },
+            // Periodic heartbeat.
+            _ = heartbeat.tick() => {
+                if send_event(&mut sender, &crate::state::ConnectorEvent::Ping)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            // Connector → server: we only watch for close / error to detect
+            // liveness (the connector has nothing it needs to tell us here yet).
+            msg = receiver.next() => match msg {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    state.connector_unregister(&account_id, id);
+}
+
+/// Serialize and send one control-channel event as a WebSocket text frame.
+async fn send_event(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    event: &crate::state::ConnectorEvent,
+) -> anyhow::Result<()> {
+    let text = serde_json::to_string(event)?;
+    sender.send(Message::Text(text.into())).await?;
+    Ok(())
+}
+
+/// Connector-online status for the web onboarding UI: does the calling account
+/// have a connector live on the control channel right now? Browser (cookie)
+/// auth — the web polls or long-refreshes this to flip "🔴 set up connector" to
+/// "🟢 connector online" the instant the user's connector pairs.
+async fn connector_status(
+    State(state): State<Arc<ServerState>>,
+    account: AuthedAccount,
+) -> Response {
+    let count = state.connector_count(&account.account_id);
+    axum::Json(serde_json::json!({ "online": count > 0, "connectors": count })).into_response()
 }
 
 /// Board key endpoint (docs/vision-round5-key-via-api-contract.md). Replaces two
