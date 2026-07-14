@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/*"]
+# The desktop tray app (VR5 F1d) is its own project — excluded so its GUI deps
+# (gtk/tray-icon) never enter the server workspace build or CI.
+exclude = ["oracle-app"]
 resolver = "2"
 
 [workspace.package]

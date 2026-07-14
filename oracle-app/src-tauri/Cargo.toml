@@ -1,0 +1,27 @@
+[package]
+name = "oracle-app"
+version = "0.1.0"
+description = "Oracle Board connector — brings your machine's agents onto the board"
+authors = ["Off-Screen"]
+edition = "2021"
+
+[lib]
+name = "oracle_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Standalone from the server workspace — its GUI deps stay out of that build.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon feature = the menu-bar / system-tray support this whole app is about.
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+# Blocking HTTP to fetch the connector engine on first run (rustls, no OpenSSL).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }

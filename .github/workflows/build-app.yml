@@ -1,0 +1,65 @@
+name: build-app
+
+# Builds the Oracle Board connector desktop app (menu-bar / system-tray) for
+# Mac + Windows via tauri-action. Linux is intentionally omitted — Linux users
+# run the CLI connector; the app targets non-technical Mac/Windows users.
+#
+# Trigger manually (Actions ▸ build-app ▸ Run workflow) or push an `app-v*` tag
+# (which uploads the installers to a GitHub Release).
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "app-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  app:
+    name: app (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin, label: mac-arm64 }
+          - { os: macos-13, target: x86_64-apple-darwin, label: mac-x64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: windows-x64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install app deps (Tauri CLI)
+        working-directory: oracle-app
+        run: npm install
+
+      - name: Build app bundle
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: oracle-app
+          args: --target ${{ matrix.target }}
+          # On an app-v* tag this creates/updates a Release with the installers.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && 'Oracle Board app' || '' }}
+
+      - name: Upload installers (dispatch runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-app-${{ matrix.label }}
+          path: |
+            oracle-app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            oracle-app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app
+            oracle-app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            oracle-app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+          if-no-files-found: warn
