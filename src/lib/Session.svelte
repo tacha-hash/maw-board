@@ -30,7 +30,8 @@
   import { makeToast } from "./toast";
   import { saveKey, removeKey } from "./boardKeys";
   import { parseJobPayload } from "./jobPayload";
-  import { parseOrderPayload, orderStatusItemId } from "./orderPayload";
+  import { parseOrderPayload, parseOrderStatusPayload, orderStatusItemId } from "./orderPayload";
+  import { alignItems, distributeItems, type AlignEdge, type DistributeAxis } from "./align";
   import {
     computeSnap,
     computeSnapTarget,
@@ -61,6 +62,8 @@
   import Avatars from "./ui/Avatars.svelte";
   import LiveCursor from "./ui/LiveCursor.svelte";
   import ContextMenu from "./ui/ContextMenu.svelte";
+  import NodeDetail from "./ui/NodeDetail.svelte";
+  import GroupMenu from "./ui/GroupMenu.svelte";
   import RosterSidebar from "./ui/RosterSidebar.svelte";
   import { slide } from "./action/slide";
   import { TouchZoom, INITIAL_ZOOM } from "./action/touchZoom";
@@ -1791,11 +1794,23 @@
       window.addEventListener("pointermove", onMarqueePointerMove);
       window.addEventListener("pointerup", onMarqueePointerUp);
       window.addEventListener("pointercancel", onMarqueePointerCancel);
-    } else if (event.button === 2 && canEdit) {
-      // RIGHT-click on empty canvas → New Node menu right at the click point.
-      const [worldX, worldY] = normalizePosition(event);
-      contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
     }
+    // RIGHT-click → New Node menu is opened from `contextmenu` (onFabricContextMenu),
+    // NOT here: opening on pointerdown let the menu's backdrop swallow the same
+    // click's native `contextmenu` and close it instantly under a real mouse —
+    // now there's no right-drag gesture on empty canvas to disambiguate, so the
+    // `contextmenu` event is the correct, robust trigger (matches node popovers).
+  }
+
+  // RIGHT-click on empty canvas → New Node menu at the click point. Driven by
+  // `contextmenu` (fires once, wherever the click lands) so the menu opens
+  // reliably across OSes with a real mouse. Node right-clicks stopPropagation
+  // in Board, so this only ever fires for the bare canvas.
+  function onFabricContextMenu(event: MouseEvent) {
+    event.preventDefault(); // always suppress the browser's native menu
+    if (event.target !== fabricEl || !canEdit) return;
+    const [worldX, worldY] = normalizePosition(event);
+    contextMenu = { screenX: event.clientX, screenY: event.clientY, worldX, worldY };
   }
 
   function onMarqueePointerMove(event: PointerEvent) {
@@ -1874,6 +1889,128 @@
 
   function clearSelection() {
     if (selectedIds.size > 0) selectedIds = new Set();
+  }
+
+  // ── VR4 right-click node: Detail popover + Group menu ────────────────────
+  // docs/vision-round4-node-detail-design.md. Board reports a right-click on a
+  // node (pointerup-without-drag) via `nodeContextMenu`; here we pick the
+  // surface from the current selection — same rule as group-drag: a node in a
+  // multi-selection → Group menu (acts on all selected); otherwise → single
+  // Detail (and reset the selection to just that node).
+  let detailNodeId: string | null = null;
+  let detailPos: { x: number; y: number } | null = null;
+  let groupMenu: { x: number; y: number; count: number } | null = null;
+
+  // Live item behind the open Detail popover (recomputed as boardItems change,
+  // so geometry edits reflect immediately and a delete auto-closes it).
+  $: detailItem = detailNodeId ? boardItems.find((it) => it.id === detailNodeId) ?? null : null;
+  $: if (detailNodeId && !detailItem) closeDetail();
+  // A done job's result tile (<id>-out) — enables the "Open result" button.
+  $: detailHasResult =
+    detailItem?.kind === "job" &&
+    parseJobPayload(detailItem.dataUrl).state === "done" &&
+    boardItems.some((it) => it.id === `${detailItem?.id}-out`);
+  // Per-agent status for an order Detail, joined from its order-status sibling.
+  $: detailOrderStatus =
+    detailItem?.kind === "order"
+      ? Object.entries(
+          parseOrderStatusPayload(
+            boardItems.find((it) => it.id === orderStatusItemId(detailItem!.id))?.dataUrl ?? "",
+          ).status,
+        ).map(([agent, state]) => ({ agent, state }))
+      : [];
+
+  function handleNodeContextMenu(id: string, clientX: number, clientY: number) {
+    const item = boardItems.find((it) => it.id === id);
+    if (!item) return;
+    if (selectedIds.has(id) && selectedIds.size > 1) {
+      detailNodeId = null;
+      detailPos = null;
+      groupMenu = { x: clientX, y: clientY, count: selectedIds.size };
+    } else {
+      groupMenu = null;
+      // Reset the selection to just this node (mirrors "drag a non-selected
+      // node clears the selection") so the ring shows what the panel edits.
+      if (!(selectedIds.size === 1 && selectedIds.has(id))) selectedIds = new Set([id]);
+      detailNodeId = id;
+      detailPos = { x: clientX, y: clientY };
+    }
+  }
+
+  function closeDetail() {
+    detailNodeId = null;
+    detailPos = null;
+  }
+
+  /** Duplicate a single item: same payload, new id, offset so it's visible. */
+  function duplicateItem(id: string) {
+    if (!canEdit) return;
+    const item = boardItems.find((it) => it.id === id);
+    if (!item || item.kind === "stream") return;
+    const copy: BoardItem = {
+      ...item,
+      id: crypto.randomUUID(),
+      x: item.x + 24,
+      y: item.y + 24,
+    };
+    upsertBoardItem(copy);
+    srocket?.send({ boardPut: copy });
+    return copy.id;
+  }
+
+  /** Pan the viewport to centre a given item at the current zoom (used by the
+   *  job Detail's "Open result"). touchZoom owns center/zoom, so we solve for
+   *  the center that lands the item at the viewport centre — same inversion as
+   *  fitToContent. */
+  function focusItemId(id: string) {
+    const it = boardItems.find((b) => b.id === id);
+    if (!it || !touchZoom) return;
+    const off = getConstantOffset();
+    const z = zoom;
+    const cx = it.x + it.w / 2 + off[0] - window.innerWidth / (2 * z);
+    const cy = it.y + it.h / 2 + off[1] - window.innerHeight / (2 * z);
+    touchZoom.moveTo([cx, cy], z);
+  }
+
+  function openJobResult(jobId: string) {
+    const outId = `${jobId}-out`;
+    if (!boardItems.some((it) => it.id === outId)) return;
+    focusItemId(outId);
+    selectedIds = new Set([outId]);
+    closeDetail();
+  }
+
+  // ── Group menu actions (operate on the whole selection) ──────────────────
+  function selectedItems(): BoardItem[] {
+    return boardItems.filter((it) => selectedIds.has(it.id));
+  }
+
+  function handleGroupAlign(edge: AlignEdge) {
+    if (!canEdit) return;
+    for (const p of alignItems(selectedItems(), edge)) handleBoardMove(p.id, p.x, p.y);
+  }
+
+  function handleGroupDistribute(axis: DistributeAxis) {
+    if (!canEdit) return;
+    for (const p of distributeItems(selectedItems(), axis)) handleBoardMove(p.id, p.x, p.y);
+  }
+
+  function handleGroupDuplicate() {
+    if (!canEdit) return;
+    const newIds = new Set<string>();
+    for (const id of [...selectedIds]) {
+      const nid = duplicateItem(id);
+      if (nid) newIds.add(nid);
+    }
+    if (newIds.size > 0) selectedIds = newIds; // selection follows the copies
+    groupMenu = null;
+  }
+
+  function handleGroupDelete() {
+    if (!canEdit) return;
+    for (const id of [...selectedIds]) handleBoardDelete(id);
+    selectedIds = new Set();
+    groupMenu = null;
   }
 
   // Shared markdown document — a singleton board item synced to all peers
@@ -3110,7 +3247,7 @@
     class="absolute inset-0 overflow-hidden touch-none"
     bind:this={fabricEl}
     on:pointerdown={onFabricPointerDown}
-    on:contextmenu={(event) => event.preventDefault()}
+    on:contextmenu={onFabricContextMenu}
   >
     <Board
       items={boardItems}
@@ -3127,6 +3264,8 @@
       extraGuidesH={termGuidesH}
       {selectedIds}
       on:clearSelection={clearSelection}
+      on:nodeContextMenu={({ detail }) =>
+        handleNodeContextMenu(detail.id, detail.clientX, detail.clientY)}
       bind:dropTargetShellId
       bind:assetLinkPreview
       on:move={({ detail }) =>
@@ -3177,6 +3316,40 @@
         on:meeting={() =>
           makeToast({ kind: "info", message: "Meeting node — coming soon." })}
         on:close={closeContextMenu}
+      />
+    {/if}
+
+    {#if detailItem && detailPos}
+      {@const di = detailItem}
+      <NodeDetail
+        item={di}
+        {canEdit}
+        x={detailPos.x}
+        y={detailPos.y}
+        hasResult={detailHasResult}
+        orderStatus={detailOrderStatus}
+        on:move={({ detail }) => handleBoardMove(di.id, detail.x, detail.y)}
+        on:resize={({ detail }) => handleBoardResize(di.id, detail.w, detail.h)}
+        on:noteEdit={({ detail }) => handleNoteEdit(di.id, detail)}
+        on:duplicate={() => duplicateItem(di.id)}
+        on:delete={() => { handleBoardDelete(di.id); closeDetail(); }}
+        on:openResult={() => openJobResult(di.id)}
+        on:close={closeDetail}
+      />
+    {/if}
+
+    {#if groupMenu}
+      {@const gm = groupMenu}
+      <GroupMenu
+        x={gm.x}
+        y={gm.y}
+        count={gm.count}
+        {canEdit}
+        on:align={({ detail }) => handleGroupAlign(detail)}
+        on:distribute={({ detail }) => handleGroupDistribute(detail)}
+        on:duplicate={handleGroupDuplicate}
+        on:delete={handleGroupDelete}
+        on:close={() => (groupMenu = null)}
       />
     {/if}
 

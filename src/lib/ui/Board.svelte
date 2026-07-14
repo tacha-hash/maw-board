@@ -137,6 +137,12 @@
     /** A drag started on a board item that isn't in the current selection —
      * Session clears the marquee selection (VR4). */
     clearSelection: void;
+    /** Right-click on a node (no drag) — Session opens the node's Detail
+     * popover, or the Group menu if the node is part of a multi-selection
+     * (VR4, docs/vision-round4-node-detail-design.md). Driven from pointer
+     * events, not native `contextmenu`, for the same cross-OS-timing reason
+     * as the marquee (PROGRESS.md 2026-07-12). */
+    nodeContextMenu: { id: string; clientX: number; clientY: number };
   }>();
 
   // ── Gen job node (image or video) — dataUrl is a JSON payload, not raw
@@ -518,11 +524,26 @@
   let pressEvent: PointerEvent | null = null;
   let longPressActive = false;
 
+  // VR4 right-click on a node → Detail / Group menu. Handled via `contextmenu`
+  // (not pointer events): it fires wherever the right-click lands on the node,
+  // including on children that stop pointerdown propagation (note textarea, job
+  // chips), and there's no competing right-drag-on-node gesture to disambiguate
+  // — so the cross-OS timing worry that shaped the marquee doesn't apply here.
+  function onNodeContextMenu(event: MouseEvent, item: BoardItem) {
+    event.preventDefault(); // suppress the browser's native menu
+    event.stopPropagation(); // don't let the fabric-level handler double-handle
+    dispatch("nodeContextMenu", { id: item.id, clientX: event.clientX, clientY: event.clientY });
+  }
+
   function onPointerDown(event: PointerEvent, item: BoardItem) {
     if (hasWriteAccess === false) return;
     // Mouse: only the LEFT button drags a node. Right-drag is the marquee
     // gesture (VR4) — it must not move whatever node it happens to start on
     // (this also fixes a latent bug where any mouse button moved a node).
+    // The right-click *menu* is handled by onNodeContextMenu (contextmenu),
+    // not here — driving it off pointerdown would miss clicks that land on a
+    // child element that stops pointerdown propagation (note textarea, job
+    // model chips, buttons); `contextmenu` isn't stopped by those children.
     if (event.pointerType === "mouse" && event.button !== 0) return;
     // Keep the gesture on the item — don't let the canvas pan-handler also
     // claim it (caused touch drags to fight board panning).
@@ -739,6 +760,7 @@
       class:is-selected={selectedIds.has(item.id)}
       style:width="{item.w}px"
       on:pointerdown={(event) => onPointerDown(event, item)}
+      on:contextmenu={(event) => onNodeContextMenu(event, item)}
     >
       {#if item.kind === "job"}
         {@const job = parseJob(item.dataUrl)}
