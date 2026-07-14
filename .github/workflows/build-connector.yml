@@ -1,0 +1,81 @@
+name: build-connector
+
+# Cross-platform release builds of the fork `sshx` CLI — the `--join` client the
+# Oracle Board connector spawns to mirror a machine's terminals onto the board.
+# The fork adds `--connector-token`, so upstream sshx binaries can't be used.
+# Each target builds NATIVELY on a matching runner (no cross-compile), so the
+# sshx-core protoc codegen just works. Linux is static (musl) for portability.
+#
+# Trigger manually (Actions ▸ build-connector ▸ Run workflow) or by pushing a
+# tag `connector-v*` (which also attaches the binaries to a GitHub Release).
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "connector-v*"
+
+permissions:
+  contents: write # attach binaries to a Release on tag
+
+jobs:
+  sshx-cli:
+    name: sshx CLI (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,     target: x86_64-unknown-linux-musl,  label: linux-x64,    musl: true }
+          - { os: ubuntu-24.04-arm,  target: aarch64-unknown-linux-musl, label: linux-arm64,  musl: true }
+          - { os: macos-14,          target: aarch64-apple-darwin,       label: darwin-arm64, musl: false }
+          - { os: macos-13,          target: x86_64-apple-darwin,        label: darwin-x64,   musl: false }
+          - { os: windows-latest,    target: x86_64-pc-windows-msvc,     label: windows-x64,  musl: false }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust + target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: musl toolchain (linux static)
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build fork sshx CLI
+        run: cargo build --release -p sshx --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.label }}" = "windows-x64" ]; then
+            cp "target/${{ matrix.target }}/release/sshx.exe" "dist/sshx-${{ matrix.label }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/sshx" "dist/sshx-${{ matrix.label }}"
+          fi
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshx-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to Release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
