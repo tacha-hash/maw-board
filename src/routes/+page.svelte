@@ -16,6 +16,7 @@
     ClockIcon,
     KeyIcon,
     Trash2Icon,
+    UserIcon,
   } from "svelte-feather-icons";
   import { makeToast } from "$lib/toast";
   import { keyFor, saveKey, removeKey } from "$lib/boardKeys";
@@ -155,6 +156,9 @@
   <div class="lobby-head">
     <h1>Oracle Board</h1>
     <div class="head-actions">
+      <a class="icon-btn" href="/account" title="Account & connector settings">
+        <UserIcon size="16" />
+      </a>
       <button class="icon-btn" title="Refresh" on:click={loadBoards} disabled={loading}>
         <RefreshCwIcon size="16" class={loading ? "spin" : ""} />
       </button>
