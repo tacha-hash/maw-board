@@ -45,6 +45,17 @@ jobs:
 
       - name: Build app bundle
         uses: tauri-apps/tauri-action@v0
+        env:
+          # macOS code-signing + notarization. Empty until the repo secrets are
+          # added (post Apple-Developer enrollment) → tauri-action builds
+          # UNSIGNED, exactly like today. Once set, every build is signed +
+          # notarized (no Gatekeeper warning). See docs/vision-round5-f1d-native-app.md.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: oracle-app
           args: --target ${{ matrix.target }}
